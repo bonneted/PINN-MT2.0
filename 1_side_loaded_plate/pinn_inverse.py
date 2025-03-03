@@ -56,6 +56,7 @@ parser.add_argument('--num_measurments', type=int, default=16, help='Number of m
 parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussian noise magnitude (not for DIC simulated)')
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
+parser.add_argument('--coord_normalization', type=bool, default=False, help='Normalize the input coordinates')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
@@ -83,6 +84,10 @@ if args.FEM_dataset == '3x3mm.dat': # Martin et al. (2019) example
 else : # Realistic DIC experiment (100x100mm plate)
     L_max = 100.0 # Plate width in mm
     m, b  = 0.3, 50 # Side-load parameters 0.3 N/mm, 50 N
+
+x_max = 1.0 if args.coord_normalization else L_max
+if args.coord_normalization:
+    m *= L_max
 
 E_actual  = 210e3   # Actual Young's modulus 210 GPa = 210e3 N/mm^2
 nu_actual = 0.3     # Actual Poisson's ratio
@@ -217,7 +222,7 @@ args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
 # Define the domain geometry
 geom = dde.geometry.Rectangle([0, 0], [L_max, L_max])
 
-def HardBC(x, f, x_max=L_max):
+def HardBC(x, f, x_max=x_max):
     """
     Apply hard boundary conditions via transformation.
     If x is provided as a list of 1D arrays, transform it to a 2D meshgrid.
@@ -264,6 +269,14 @@ def pde(x, f, unknowns=params_factor):
     stress_xy = S_xy - f_val[:, 4:5]
     return [momentum_x, momentum_y, stress_x, stress_y, stress_xy]
 
+def input_scaling(x):
+    """
+    Scale the input coordinates to the range [0, 1].
+    """
+    if isinstance(x, list):
+        return [x_el / L_max for x_el in x]
+    else:
+        return x / L_max
 # =============================================================================
 # 7. Define Neural Network, Data, and Model
 # =============================================================================
@@ -281,11 +294,13 @@ data = dde.data.PDE(
     num_test=args.num_point_test,
     is_SPINN=True,
 )
+if args.coord_normalization:
+    net.apply_feature_transform(input_scaling)
 net.apply_output_transform(HardBC)
 
 model = dde.Model(data, net)
 model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-              loss_weights=args.loss_weights, loss=args.loss_fn,
+              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn,
               external_trainable_variables=trainable_variables)
 
 # =============================================================================
@@ -335,7 +350,35 @@ for i, field in enumerate(args.log_output_fields): # Log output fields
     )
 
 # =============================================================================
-# 9. Training
+# 9. Calculate Loss Weights based on the Gradient of the Loss Function
+# =============================================================================
+from jax.flatten_util import ravel_pytree
+def loss_function(params,comp=0,inputs=[X_DIC_input]*len(bcs)+[X_plot]):
+    return model.outputs_losses_train(params, inputs, None)[1][comp]
+
+n_loss = len(args.loss_weights)
+
+def calc_loss_weights(model):
+    loss_grads = [1]*n_loss
+
+    for i in range(n_loss):
+        grad_fn = jax.grad(lambda params,comp=i: loss_function(params,comp))
+        grads = grad_fn(model.params)[0]
+        flattened_grad = ravel_pytree(list(grads.values())[0])[0]
+        loss_grads[i] = jnp.linalg.norm(flattened_grad)
+
+    loss_grads = jnp.array(loss_grads)
+    loss_weights_grads = jnp.sqrt(jnp.sum(loss_grads)/loss_grads) # Caution: ad-hoc sqrt
+    return loss_weights_grads, loss_grads
+
+loss_weights_grads, loss_grads = calc_loss_weights(model)
+new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
+model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+              loss_weights=new_loss_weights, loss=args.loss_fn,
+              external_trainable_variables=trainable_variables)
+
+# =============================================================================
+# 10. Training
 # =============================================================================
 start_time = time.time()
 print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
@@ -343,7 +386,7 @@ losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbac
 elapsed = time.time() - start_time
 
 # =============================================================================
-# 10. Logging
+# 11. Logging
 # =============================================================================
 dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_history.dat"))
 
