@@ -313,7 +313,8 @@ if args.DIC_dataset_path != "no_dataset":
 else:
     dic_prefix = ''
     noise_prefix = f"{args.noise_magnitude}noise"
-folder_name = f"{dic_prefix}{args.measurments_type}_x{args.num_measurments}_{noise_prefix}_{args.available_time if args.available_time else args.n_iter}{'min' if args.available_time else 'iter'}"
+num_measurments_str = f"{X_DIC_input[0].shape[0]}x{X_DIC_input[1].shape[0]}"
+folder_name = f"{dic_prefix}{args.measurments_type}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else args.n_iter}{'min' if args.available_time else 'iter'}"
 existing_folders = [f for f in os.listdir(results_path) if f.startswith(folder_name)]
 if existing_folders:
     suffixes = [int(f.split("-")[-1]) for f in existing_folders if f != folder_name]

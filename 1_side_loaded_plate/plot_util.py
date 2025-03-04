@@ -34,7 +34,7 @@ def init_metrics(ax, steps, metrics, metrics_names, step_type="iteration", time_
     ax.set_yscale('log')
     lines = []
     scatters = []
-    colors_list = ['b', 'r', 'g', 'y']
+    colors_list = plt.cm.tab10.colors
     for idx in metrics_idx:
         # Plot background (faded) curve
         ax.plot(steps, metrics[idx], alpha=0.2, color=colors_list[idx])
