@@ -1,2 +1,4 @@
 **/results*/**/*.dat
-
+1_side_loaded_plate/2_noise_study/results/0noise/*
+1_side_loaded_plate/2_noise_study/results/1noise/*
+1_side_loaded_plate/0_test/*
