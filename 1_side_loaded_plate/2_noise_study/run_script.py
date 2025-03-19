@@ -10,8 +10,9 @@ args = {
     "FEM_dataset": "100x100mm.dat",
     # "n_iter": 40000,
     "available_time": 2,
-    "loss_weights": [1,1,1,1,1,1e2,1e2],
+    "loss_weights": [1,1,1,1,1,1,1e2,1e2],
     "log_every": 250,
+    "num_point_PDE": 150**2,
 }
 
 # Flatten the args dictionary into a list of command line arguments
@@ -39,7 +40,7 @@ except subprocess.CalledProcessError as e:
     print(e)
     sys.exit(1)
 
-5 runs for displacement and strain without noise
+#5 runs for displacement and strain without noise
 args["DIC_dataset_path"] = f"2_noise_study/data_dic/{camera_resolution}/0noise"
 args["DIC_dataset_number"] = 1 # 0 is reference image
 args["results_path"] = r"2_noise_study/results/0noise"
