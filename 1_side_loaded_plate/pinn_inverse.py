@@ -40,7 +40,7 @@ parser.add_argument('--available_time', type=int, default=2, help='Available tim
 parser.add_argument('--log_output_fields', nargs='*', default=['Ux', 'Uy', 'Exx', 'Eyy', 'Exy', 'Sxx', 'Syy', 'Sxy'], help='Fields to log')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
-parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
+parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
 parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of collocation points for PDE evaluation')
 parser.add_argument('--num_point_test', type=int, default=100000, help='Number of test points')
 
@@ -57,6 +57,7 @@ parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussia
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
 parser.add_argument('--coord_normalization', type=bool, default=False, help='Normalize the input coordinates')
+parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
@@ -145,7 +146,7 @@ def strain_from_output(x, f):
     return jnp.hstack([E_xx, E_yy, E_xy])
 
 # =============================================================================
-# 5. Setup Measurement Data Based on Type (Displacement, Strain, DIC)
+# 5.1 Setup Measurement Data Based on Type (Displacement, Strain, DIC)
 # =============================================================================
 args.num_measurments = int(np.sqrt(args.num_measurments))**2
 if args.measurments_type == "displacement":
@@ -217,6 +218,24 @@ else:
 args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
 
 # =============================================================================
+# 5.2 Setup Integral Constraint for Stress Integral
+# =============================================================================
+
+n_integral = 100
+x_integral = np.linspace(0, x_max, n_integral)
+y_integral = np.linspace(0, x_max, n_integral)
+integral_points = [x_integral.reshape(-1,1), y_integral.reshape(-1,1)]
+
+def integral_stress(x, outputs, X):
+    x = transform_coords(x)
+    y_grid = x[:, 1].reshape((n_integral, n_integral))
+    Sxx = outputs[0][:, 2:3].reshape((n_integral, n_integral))
+    return jnp.trapezoid(Sxx, y_grid, axis=1)
+
+Integral_BC = dde.PointSetOperatorBC(integral_points, (b+m*x_max/2) * x_max, integral_stress)
+bcs.append(Integral_BC)
+
+# =============================================================================
 # 6. PINN Implementation: Boundary Conditions and PDE Residual
 # =============================================================================
 # Define the domain geometry
@@ -231,7 +250,7 @@ def HardBC(x, f, x_max=x_max):
         x = transform_coords(x)
     Ux  = f[:, 0] * x[:, 0]/x_max * args.u_0[0] 
     Uy  = f[:, 1] * x[:, 1]/x_max * args.u_0[1]
-    Sxx = f[:, 2] * (x_max - x[:, 0])/x_max + side_load(x[:, 1])
+    Sxx = f[:, 2] if args.stress_integral else f[:, 2] * (x_max - x[:, 0])/x_max + side_load(x[:, 1])
     Syy = f[:, 3] * (x_max - x[:, 1])/x_max
     Sxy = f[:, 4] * x[:, 0]/x_max * (x_max - x[:, 0])/x_max * x[:, 1]/x_max * (x_max - x[:, 1])/x_max
     return dde.backend.stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
@@ -354,7 +373,7 @@ for i, field in enumerate(args.log_output_fields): # Log output fields
 # 9. Calculate Loss Weights based on the Gradient of the Loss Function
 # =============================================================================
 from jax.flatten_util import ravel_pytree
-def loss_function(params,comp=0,inputs=[X_DIC_input]*len(bcs)+[X_plot]):
+def loss_function(params,comp=0,inputs=[X_DIC_input]*(len(bcs)-1)+[integral_points]+[X_plot]):
     return model.outputs_losses_train(params, inputs, None)[1][comp]
 
 n_loss = len(args.loss_weights)
