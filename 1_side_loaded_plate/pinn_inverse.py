@@ -27,7 +27,7 @@ def transform_coords(x):
     For SPINN, if the input x is provided as a list of 1D arrays (e.g., [X_coords, Y_coords]),
     this function creates a 2D meshgrid and stacks the results into a 2D coordinate array.
     """
-    x_mesh = [x_.ravel() for x_ in jnp.meshgrid(x[0].squeeze(), x[1].squeeze(), indexing="ij")]
+    x_mesh = [x_.ravel() for x_ in jnp.meshgrid(jnp.atleast_1d(x[0].squeeze()), jnp.atleast_1d(x[1].squeeze()), indexing="ij")]
     return dde.backend.stack(x_mesh, axis=-1)
 
 # =============================================================================
