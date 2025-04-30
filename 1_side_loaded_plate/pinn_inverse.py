@@ -146,7 +146,24 @@ def strain_from_output(x, f):
     return jnp.hstack([E_xx, E_yy, E_xy])
 
 # =============================================================================
-# 5.1 Setup Measurement Data Based on Type (Displacement, Strain, DIC)
+# 5.1 Setup Integral Constraint for Stress Integral
+# =============================================================================
+n_integral = 100
+x_integral = np.linspace(0, L_max, n_integral)
+y_integral = np.linspace(0, L_max, n_integral)
+integral_points = [x_integral.reshape(-1,1), y_integral.reshape(-1,1)]
+
+def integral_stress(x, outputs, X):
+    x = transform_coords(x)
+    y_grid = x[:, 1].reshape((n_integral, n_integral))
+    Sxx = outputs[0][:, 2].reshape((n_integral, n_integral))
+    return jnp.trapezoid(Sxx, y_grid, axis=1)
+
+Integral_BC = dde.PointSetOperatorBC(integral_points, (b+m*L_max/2) * L_max, integral_stress)
+bcs = [Integral_BC]
+
+# =============================================================================
+# 5.2 Setup Measurement Data Based on Type (Displacement, Strain, DIC)
 # =============================================================================
 args.num_measurments = int(np.sqrt(args.num_measurments))**2
 if args.measurments_type == "displacement":
@@ -174,7 +191,7 @@ if args.measurments_type == "displacement":
                                           lambda x, f, x_np: f[0][:, 0:1]/DIC_norms[0])
     measure_Uy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 1:2]/DIC_norms[1],
                                           lambda x, f, x_np: f[0][:, 1:2]/DIC_norms[1])
-    bcs = [measure_Ux, measure_Uy]
+    bcs += [measure_Ux, measure_Uy]
 
 elif args.measurments_type == "strain":
     if args.DIC_dataset_path != "no_dataset":
@@ -205,7 +222,7 @@ elif args.measurments_type == "strain":
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 1:2]/DIC_norms[1])
     measure_Exy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 2:3]/DIC_norms[2],
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 2:3]/DIC_norms[2])
-    bcs = [measure_Exx, measure_Eyy, measure_Exy]
+    bcs += [measure_Exx, measure_Eyy, measure_Exy]
 
 else:
     raise ValueError("Invalid measurement type. Choose 'displacement' or 'strain'.")
@@ -216,24 +233,6 @@ if args.DIC_dataset_path != "no_dataset":
 else:
     disp_norms = np.mean(np.abs(solution_fn(X_DIC_input)[:, :2]), axis=0)
 args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
-
-# =============================================================================
-# 5.2 Setup Integral Constraint for Stress Integral
-# =============================================================================
-
-n_integral = 100
-x_integral = np.linspace(0, x_max, n_integral)
-y_integral = np.linspace(0, x_max, n_integral)
-integral_points = [x_integral.reshape(-1,1), y_integral.reshape(-1,1)]
-
-def integral_stress(x, outputs, X):
-    x = transform_coords(x)
-    y_grid = x[:, 1].reshape((n_integral, n_integral))
-    Sxx = outputs[0][:, 2:3].reshape((n_integral, n_integral))
-    return jnp.trapezoid(Sxx, y_grid, axis=1)
-
-Integral_BC = dde.PointSetOperatorBC(integral_points, (b+m*x_max/2) * x_max, integral_stress)
-bcs.append(Integral_BC)
 
 # =============================================================================
 # 6. PINN Implementation: Boundary Conditions and PDE Residual
