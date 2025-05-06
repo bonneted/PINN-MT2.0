@@ -52,12 +52,13 @@ parser.add_argument('--mlp', choices=['mlp', 'modified_mlp'], default='mlp', hel
 parser.add_argument('--initialization', choices=['Glorot uniform', 'He normal'], default='Glorot uniform', help='Initialization method')
 
 parser.add_argument('--measurments_type', choices=['displacement','strain'], default='strain', help='Type of measurements')
-parser.add_argument('--num_measurments', type=int, default=16, help='Number of measurements (should be a perfect square)')
+parser.add_argument('--num_measurments', nargs='+', type=int, default=[12,10], help='Number of measurements (should be a perfect square)')
 parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussian noise magnitude (not for DIC simulated)')
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
 parser.add_argument('--coord_normalization', type=bool, default=False, help='Normalize the input coordinates')
 parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
+parser.add_argument('--material_law', choices=['isotropic', 'orthotropic'], default='isotropic', help='Material law')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
@@ -84,15 +85,38 @@ J2S, J2L = 15.0, 23.0    # right clamp lengths
 gauge    = 30.0          # central gauge length
 w        = 20.0          # specimen height
 t        =  2.3          # thickness depth
-Xmax     = gauge + J1L + J2L  # total length
+L     = gauge + J1L + J2L  # total length
 u_right = -0.637382 # right clamp displacement from FEM simulation
 
-x_max = (1.0, 1.0)  if args.coord_normalization else (w, Xmax)
+x_max = (1.0, 1.0)  if args.coord_normalization else (w, L)
 
 # Material parameters (converted to N/mm^2)
+if args.material_law.lower() == "isotropic":
+    # isotropic plane‐stress
+    E       = 52e3     # N/mm^2
+    nu      = 0.3
+    F_target = -2544.0
 
-Q11, Q22, Q12, Q66 = 41e3, 10.3e3, 3.1e3, 4e3
-F_target = -702.0
+    def constitutive_stress(eps_xx, eps_yy, eps_xy):
+        # plane‐stress modified constants
+        C1 = E/(1 - nu**2)      # factor for normal
+        C2 = E/(1 + nu)         # factor for shear
+        σ_xx = C1*(eps_xx + nu*eps_yy)
+        σ_yy = C1*(eps_yy + nu*eps_xx)
+        σ_xy = C2*eps_xy
+        return σ_xx, σ_yy, σ_xy
+
+elif args.material_law.lower() == "orthotropic":
+    # orthotropic plane‐stress
+    Q11, Q22, Q12, Q66 = 41e3, 10.3e3, 3.1e3, 4e3   # N/mm^2
+    F_target = -702.0
+
+    def constitutive_stress(eps_xx, eps_yy, eps_xy):
+        # plane‐stress modified constants
+        σ_xx = Q11*eps_xx + Q12*eps_yy
+        σ_yy = Q12*eps_xx + Q22*eps_yy
+        σ_xy = 2*Q66*eps_xy
+        return σ_xx, σ_yy, σ_xy
 
 # Create trainable scaling factors (one per parameter)
 params_factor = [dde.Variable(1 / s) for s in args.params_iter_speed]
@@ -103,22 +127,27 @@ trainable_variables = params_factor
 # =============================================================================
 dir_path = os.path.dirname(os.path.realpath(__file__))
 fem_file = os.path.join(dir_path, r"data_fem", args.FEM_dataset)
+n_rows, n_cols = map(int, args.FEM_dataset.replace('.dat', '').split('_')[-1].split('x'))
+
 data = np.loadtxt(fem_file)
-x_val      = data[:, :, 0]
-y_val      = data[:, :, 1]
-u_val      = data[:, :, 2:4]
-strain_val = data[:, :, 4:7]
-stress_val = data[:, :, 7:10]
+x_val      = data[:, 0]
+y_val      = data[:, 1]
+u_val      = data[:, 2:4]
+strain_val = data[:, 4:7]
+stress_val = data[:, 7:10]
 solution_val = np.hstack((u_val, stress_val))
 
+# Interpolate solution
+x_grid = np.unique(x_val)
+y_grid = np.unique(y_val)
 
 def create_interpolation_fn(data_array):
     num_components = data_array.shape[1]
     interpolators = []
     for i in range(num_components):
         interp = RegularGridInterpolator(
-            (x_val, y_val),
-            data_array[:, :, i],
+            (x_grid, y_grid),
+            data_array[:, i].reshape(n_rows, n_cols).T,
         )
         interpolators.append(interp)
     def interpolation_fn(x):
@@ -143,10 +172,10 @@ def strain_from_output(x, f):
 # 5.1 Setup Integral Constraint for Stress Integral
 # =============================================================================
 n_integral = 100
-x_integral_top = np.linspace(Xmax-J2L+gauge, Xmax, n_integral)
+x_integral_top = np.linspace(L-J2L+gauge, L, n_integral)
 y_integral_top = np.ones(1) * w
 
-x_integral_bottom = np.linspace(Xmax-J2S, Xmax, n_integral)
+x_integral_bottom = np.linspace(L-J2S, L, n_integral)
 y_integral_bottom = np.zeros(1)
 
 
@@ -167,7 +196,6 @@ def integral_stress(x, outputs, X):
 # =============================================================================
 # 5.2 Setup Measurement Data Based on Type (Displacement, Strain, DIC)
 # =============================================================================
-args.num_measurments = int(np.sqrt(args.num_measurments))**2
 if args.measurments_type == "displacement":
     if args.DIC_dataset_path != "no_dataset":
         dic_path = os.path.join(dir_path, args.DIC_dataset_path)
@@ -184,7 +212,8 @@ if args.measurments_type == "displacement":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, L_max, args.num_measurments).reshape(-1, 1)] * 2
+        X_DIC_input = [np.linspace(J1L, J1L+gauge, args.num_measurments[0]).reshape(-1, 1),
+                      np.linspace(0, w, args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = solution_fn(X_DIC_input)[:, :2]
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
 
@@ -193,7 +222,7 @@ if args.measurments_type == "displacement":
                                           lambda x, f, x_np: f[0][:, 0:1]/DIC_norms[0])
     measure_Uy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 1:2]/DIC_norms[1],
                                           lambda x, f, x_np: f[0][:, 1:2]/DIC_norms[1])
-    bcs += [measure_Ux, measure_Uy]
+    bcs = [measure_Ux, measure_Uy]
 
 elif args.measurments_type == "strain":
     if args.DIC_dataset_path != "no_dataset":
@@ -214,7 +243,8 @@ elif args.measurments_type == "strain":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, L_max, args.num_measurments).reshape(-1, 1)] * 2
+        X_DIC_input = [np.linspace(J1L, J1L+gauge, args.num_measurments[0]).reshape(-1, 1),
+                      np.linspace(0, w, args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = strain_fn(X_DIC_input)
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
     DIC_norms = np.mean(np.abs(DIC_data), axis=0) # to normalize the loss
@@ -224,7 +254,7 @@ elif args.measurments_type == "strain":
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 1:2]/DIC_norms[1])
     measure_Exy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 2:3]/DIC_norms[2],
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 2:3]/DIC_norms[2])
-    bcs += [measure_Exx, measure_Eyy, measure_Exy]
+    bcs = [measure_Exx, measure_Eyy, measure_Exy]
 
 else:
     raise ValueError("Invalid measurement type. Choose 'displacement' or 'strain'.")
@@ -240,7 +270,33 @@ args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
 # 6. PINN Implementation: Boundary Conditions and PDE Residual
 # =============================================================================
 # Define the domain geometry
-geom = dde.geometry.Rectangle([0, 0], [Xmax, w])
+geom = dde.geometry.Rectangle([0, 0], [L, w])
+
+def weighting(x1, x2, J1L=J1L, gauge=gauge, w=w, k=100):
+    if args.coord_normalization:
+        J1L = J1L / L
+        gauge = gauge / L
+        w = 1
+    # Smooth step function: sigmoid-like behavior
+    s = lambda z: 1 / (1 + jnp.exp(-k * z))
+
+    # Define left-bottom clamp: vanishes for x1 < J1L and x2 = 0
+    w1 = s(x1 - J1L) + x2  # zero when x1 < J1L and x2 = 0
+
+    # Define right-top clamp: vanishes for x1 > J1L+gauge and x2 = w
+    w2 = s(J1L + gauge - x1) + (w - x2)  # zero when x1 > J1L+gauge and x2 = w
+
+    return w1 * w2
+
+def Uy_bc(x1, x2, J1L, gauge, U, coord_normalization=False, L=1.0):
+    if coord_normalization:
+        J1L = J1L / L
+        gauge = gauge / L
+
+    # Compute linear ramp: 0 if x1 <= J1L, U if x1 >= J1L+gauge, else linearly increasing
+    Uy = (x1 - J1L) / gauge * U
+    Uy = jnp.clip(Uy, 0.0, U)
+    return Uy
 
 def HardBC(x, f, x_max=x_max):
     """
@@ -249,11 +305,11 @@ def HardBC(x, f, x_max=x_max):
     """
     if isinstance(x, list):
         x = transform_coords(x)
-    Ux  = f[:, 0] * x[:, 0]/x_max * args.u_0[0] 
-    Uy  = f[:, 1] * x[:, 1]/x_max * args.u_0[1]
-    Sxx = f[:, 2] if args.stress_integral else f[:, 2] * (x_max - x[:, 0])/x_max + side_load(x[:, 1])
-    Syy = f[:, 3] * (x_max - x[:, 1])/x_max
-    Sxy = f[:, 4] * x[:, 0]/x_max * (x_max - x[:, 0])/x_max * x[:, 1]/x_max * (x_max - x[:, 1])/x_max
+    Ux  = f[:, 0] * args.u_0[0] 
+    Uy  = f[:, 1] #* weighting(x[:, 0], x[:, 1]) * args.u_0[1] + Uy_bc(x[:, 0], x[:, 1], J1L, gauge, u_right)
+    Sxx = f[:, 2] 
+    Syy = f[:, 3] 
+    Sxy = f[:, 4] * x[:, 0]/x_max[0] * (x_max[0] - x[:, 0])/x_max[0] * x[:, 1]/x_max[1] * (x_max[1] - x[:, 1])/x_max[1]
     return dde.backend.stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
 
 def pde(x, f, unknowns=params_factor):
@@ -261,19 +317,12 @@ def pde(x, f, unknowns=params_factor):
     Define the PDE residuals for the linear elastic plate.
     """
     x = transform_coords(x)
-    param_factors = [u * s for u, s in zip(unknowns, args.params_iter_speed)]
-    E = E_init * param_factors[0]
-    nu = nu_init * param_factors[1]
-    lmbd = E * nu / ((1 + nu) * (1 - 2 * nu))
-    mu = E / (2 * (1 + nu))
     
     E_xx = dde.grad.jacobian(f, x, i=0, j=0)[0]
     E_yy = dde.grad.jacobian(f, x, i=1, j=1)[0]
     E_xy = 0.5 * (dde.grad.jacobian(f, x, i=0, j=1)[0] + dde.grad.jacobian(f, x, i=1, j=0)[0])
     
-    S_xx = E_xx * (2 * mu + lmbd) + E_yy * lmbd
-    S_yy = E_yy * (2 * mu + lmbd) + E_xx * lmbd
-    S_xy = E_xy * 2 * mu
+    S_xx, S_yy, S_xy = constitutive_stress(E_xx, E_yy, E_xy)
 
     Sxx_x = dde.grad.jacobian(f, x, i=2, j=0)[0]
     Syy_y = dde.grad.jacobian(f, x, i=3, j=1)[0]
@@ -294,15 +343,15 @@ def input_scaling(x):
     Scale the input coordinates to the range [0, 1].
     """
     if isinstance(x, list):
-        return [x_el / L_max for x_el in x]
+        return [x[0] / x_max[0], x[1] / x_max[1]]
     else:
-        return x / L_max
+        return x / np.array(x_max) # TODO: check if this is correct
 # =============================================================================
 # 7. Define Neural Network, Data, and Model
 # =============================================================================
 layers = [2] + [args.net_width] * args.net_depth + [5]
 net = dde.nn.SPINN(layers, args.activation, args.initialization, args.mlp)
-batch_size = args.num_point_PDE + args.num_measurments
+batch_size = args.num_point_PDE + args.num_measurments[0] * args.num_measurments[1]
 num_params = sum(p.size for p in jax.tree.leaves(net.init(jax.random.PRNGKey(0), jnp.ones(layers[0]))))
 
 data = dde.data.PDE(
@@ -358,7 +407,7 @@ def output_log(x, output, field):
         return strain_from_output(x, output)[:, ['Exx', 'Eyy', 'Exy'].index(field)]
     raise ValueError(f"Invalid field name: {field}")
         
-X_plot = [np.linspace(0, L_max, 100).reshape(-1, 1)] * 2
+X_plot = [np.linspace(0, L, 150).reshape(-1, 1), np.linspace(0, w, 40).reshape(-1, 1)]
 for i, field in enumerate(args.log_output_fields): # Log output fields
     callbacks.append(
         dde.callbacks.OperatorPredictor(
@@ -374,7 +423,7 @@ for i, field in enumerate(args.log_output_fields): # Log output fields
 # 9. Calculate Loss Weights based on the Gradient of the Loss Function
 # =============================================================================
 from jax.flatten_util import ravel_pytree
-def loss_function(params,comp=0,inputs=[X_DIC_input]*(len(bcs)-1)+[integral_points]+[X_plot]):
+def loss_function(params,comp=0,inputs=[X_DIC_input]*len(bcs)+[X_plot]):
     return model.outputs_losses_train(params, inputs, None)[1][comp]
 
 n_loss = len(args.loss_weights)
@@ -402,7 +451,7 @@ model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
 # 10. Training
 # =============================================================================
 start_time = time.time()
-print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
+# print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
 losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbacks, display_every=args.log_every)
 elapsed = time.time() - start_time
 
@@ -411,27 +460,27 @@ elapsed = time.time() - start_time
 # =============================================================================
 dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_history.dat"))
 
-params_init = [E_init, nu_init]
+# params_init = [E_init, nu_init]
 variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
 
 # Read the variables history
-with open(variables_history_path, "r") as f:
-    lines = f.readlines()
+# with open(variables_history_path, "r") as f:
+#     lines = f.readlines()
 
 # Update the variables history with scaled values
-with open(variables_history_path, "w") as f:
-    for line in lines:
-        step, value = line.strip().split(' ', 1)
-        values = [scale * init * val for scale, init, val in zip(args.params_iter_speed, params_init, eval(value))]
-        f.write(f"{step} " + dde.utils.list_to_str(values, precision=8) + "\n")
+# with open(variables_history_path, "w") as f:
+#     for line in lines:
+#         step, value = line.strip().split(' ', 1)
+#         values = [scale * init * val for scale, init, val in zip(args.params_iter_speed, params_init, eval(value))]
+#         f.write(f"{step} " + dde.utils.list_to_str(values, precision=8) + "\n")
 
 # Read the variables history
-with open(variables_history_path, "r") as f:
-    lines = f.readlines()
+# with open(variables_history_path, "r") as f:
+#     lines = f.readlines()
 # Final E and nu values as the average of the last 10 values 
-E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
-nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
-print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
+# E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
+# nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
+# print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
 
 def log_config(fname):
     """
@@ -469,13 +518,20 @@ def log_config(fname):
         "logged_fields": args.log_output_fields,
     }
     problem_info = {
-        "L_max": L_max,
-        "E_actual": E_actual,
-        "nu_actual": nu_actual,
-        "E_init": E_init,
-        "nu_init": nu_init,
-        "E_final": E_final,
-        "nu_final": nu_final,
+        "L": L,
+        "w": w,
+        "t": t,
+        "J1S": J1S,
+        "J1L": J1L,
+        "J2S": J2S,
+        "J2L": J2L,
+        "gauge": gauge,
+        # "E_actual": E_actual,
+        # "nu_actual": nu_actual,
+        # "E_init": E_init,
+        # "nu_init": nu_init,
+        # "E_final": E_final,
+        # "nu_final": nu_final,
     }
     data_info = {
         "num_measurments": (int(np.sqrt(args.num_measurments)))**2,
