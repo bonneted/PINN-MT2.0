@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import deepxde as dde
 from scipy.interpolate import RegularGridInterpolator
 import pandas as pd
+from typing import List, Tuple, Literal
 
 # =============================================================================
 # 1. Utility Function: Coordinate Transformation for SPINN
@@ -42,7 +43,7 @@ parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
 parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
 parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of collocation points for PDE evaluation')
-parser.add_argument('--num_point_test', type=int, default=100000, help='Number of test points')
+parser.add_argument('--num_point_test', type=int, default=10000, help='Number of test points')
 
 parser.add_argument('--net_width', type=int, default=32, help='Width of the network')
 parser.add_argument('--net_depth', type=int, default=5, help='Depth of the network')
@@ -55,8 +56,9 @@ parser.add_argument('--measurments_type', choices=['displacement','strain'], def
 parser.add_argument('--num_measurments', nargs='+', type=int, default=[12,10], help='Number of measurements (should be a perfect square)')
 parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussian noise magnitude (not for DIC simulated)')
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
+parser.add_argument('--s_0', nargs='+', type=float, default=[1,1,1], help='Stress scaling factor for Sxx, Syy, and Sxy')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
-parser.add_argument('--coord_normalization', type=bool, default=False, help='Normalize the input coordinates')
+parser.add_argument('--coord_normalization', type=bool, default=True, help='Normalize the input coordinates')
 parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
 parser.add_argument('--material_law', choices=['isotropic', 'orthotropic'], default='isotropic', help='Material law')
 
@@ -88,7 +90,7 @@ t        =  2.3          # thickness depth
 L     = gauge + J1L + J2L  # total length
 u_right = -0.637382 # right clamp displacement from FEM simulation
 
-x_max = (1.0, 1.0)  if args.coord_normalization else (w, L)
+x_max = (L, w) if args.coord_normalization else (1.0, 1.0) 
 
 # Material parameters (converted to N/mm^2)
 if args.material_law.lower() == "isotropic":
@@ -272,44 +274,122 @@ args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
 # Define the domain geometry
 geom = dde.geometry.Rectangle([0, 0], [L, w])
 
-def weighting(x1, x2, J1L=J1L, gauge=gauge, w=w, k=100):
-    if args.coord_normalization:
-        J1L = J1L / L
-        gauge = gauge / L
-        w = 1
-    # Smooth step function: sigmoid-like behavior
-    s = lambda z: 1 / (1 + jnp.exp(-k * z))
+def bc_factor(
+    x1: jnp.ndarray,
+    x2: jnp.ndarray,
+    segments: List[Tuple[Tuple[float,float], Tuple[float,float]]],
+    smoothness: Literal["C0", "C0+"] = "C0",
+) -> jnp.ndarray:
+    """
+    x1, x2 : (n,) arrays of coordinates
+    segments: list of ((xA,yA),(xB,yB))
+    smoothness: "C0" = min distance, "C0+" = product of distances
+    returns: (n,1) array
+    """
+    # helper: distance from (x1,x2) to segment A→B
+    def _dist(A, B):
+        xA, yA = A; xB, yB = B
+        vx, vy = xB - xA, yB - yA
+        # vector A→P
+        px = x1 - xA
+        py = x2 - yA
+        t = jnp.clip((px*vx + py*vy) / (vx*vx + vy*vy), 0.0, 1.0)
+        qx = xA + t*vx
+        qy = yA + t*vy
+        return jnp.hypot(x1 - qx, x2 - qy)[:, None]
 
-    # Define left-bottom clamp: vanishes for x1 < J1L and x2 = 0
-    w1 = s(x1 - J1L) + x2  # zero when x1 < J1L and x2 = 0
+    # build (n, m) matrix of distances
+    D = jnp.hstack([ _dist(A, B) for A, B in segments ])
 
-    # Define right-top clamp: vanishes for x1 > J1L+gauge and x2 = w
-    w2 = s(J1L + gauge - x1) + (w - x2)  # zero when x1 > J1L+gauge and x2 = w
+    raw = jnp.min(D, axis=1, keepdims=True)    if smoothness=="C0" else jnp.prod(D, axis=1, keepdims=True)
+    M = raw.max()
+    M = jnp.where(M > 0, M, 1.0)    # avoid dividing by 0
+    return (raw / M).flatten()
 
-    return w1 * w2
+# def Uy_bc(x1, x2, J1L, J1S, J2L, J2S, L, w, U,
+#           coord_normalization=False):
+#     if coord_normalization:
+#         J1L, J1S, J2L, J2S, L = [v/L for v in (J1L, J1S, J2L, J2S, L)]
+#         w = w / w
+#     t     = x2 / w
+#     start = J1L + (J1S - J1L) * t
+#     end   = (L - J2S) + ((L - J2L) - (L - J2S)) * t
+#     eps = 1e-6
+#     ramp_den = end - start
+#     Uy = jnp.where(
+#         x1 >= end, U,
+#         jnp.where(x1 > start,
+#                 (x1 - start) / (ramp_den + eps) * U,
+#                 0.0))
+#     return Uy
 
-def Uy_bc(x1, x2, J1L, gauge, U, coord_normalization=False, L=1.0):
+def smoothstep(x):
+    """Smoothstep function: 0 if x<0, 1 if x>1, smooth in between."""
+    x = jnp.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+def Uy_bc(x1, x2, J1L, J1S, J2L, J2S, L, w, U,
+    coord_normalization=False):
     if coord_normalization:
-        J1L = J1L / L
-        gauge = gauge / L
+        J1L, J1S, J2L, J2S, L = [v / L for v in (J1L, J1S, J2L, J2S, L)]
+        w = w / w # this line simplifies to 1.0
+    t = x2 / w
+    start = J1L + (J1S - J1L) * t
+    end = (L - J2S) + ((L - J2L) - (L - J2S)) * t
+    ramp = smoothstep((x1 - start) / (end - start + 1e-8))
+    return ramp * U
 
-    # Compute linear ramp: 0 if x1 <= J1L, U if x1 >= J1L+gauge, else linearly increasing
-    Uy = (x1 - J1L) / gauge * U
-    Uy = jnp.clip(Uy, 0.0, U)
-    return Uy
+contact_eps = 1e-2 * L
 
-def HardBC(x, f, x_max=x_max):
+segs_uy = [
+    ((0.0, 0.0), (J1L - contact_eps, 0.0)), # left bottom 
+    ((0.0, w), (J1S - contact_eps, w)), # left top
+    ((L-J2S + contact_eps, 0.0), (L, 0.0)), # right bottom
+    ((L-J2L + contact_eps, w), (L, w)), # right top
+]
+
+segs_Sxx = [
+    ((0.0, 0.0), (0.0, w)), # left 
+    ((L, 0.0), (L, w)), # right
+]
+
+segs_Syy = [
+    ((J1L + contact_eps, 0.0), (L-J2S - contact_eps, 0.0)), # bottom gauge
+    ((J1S + contact_eps, w), (L-J2L - contact_eps, w)), # top gauge
+]
+
+segs_Sxy = [
+    ((0.0, 0.0), (J1L - contact_eps, 0.0)), # bottom left
+    ((J1L + contact_eps, 0.0), (L-J2S - contact_eps, 0.0)), # bottom gauge
+    ((L-J2S + contact_eps, 0.0), (L, 0.0)), # bottom right
+    ((0.0, w), (J1S - contact_eps, w)), # top left
+    ((J1S + contact_eps, w), (L-J2L - contact_eps, w)), # top gauge
+    ((L-J2L + contact_eps, w), (L, w)), # top right
+    ((0.0, 0.0), (0.0, w)), # left
+    ((L, 0.0), (L, w)), # right
+]
+
+all_segs = [segs_uy, segs_Sxx, segs_Syy, segs_Sxy]
+if args.coord_normalization:
+    for segs in all_segs:
+        for i, seg in enumerate(segs):
+            segs[i] = [(v[0]/L, v[1]/w) for v in seg]
+
+
+def HardBC(x, f, all_segs=all_segs):
     """
     Apply hard boundary conditions via transformation.
     If x is provided as a list of 1D arrays, transform it to a 2D meshgrid.
     """
     if isinstance(x, list):
         x = transform_coords(x)
+    
+    segs_uy, segs_Sxx, segs_Syy, segs_Sxy = all_segs
     Ux  = f[:, 0] * args.u_0[0] 
-    Uy  = f[:, 1] #* weighting(x[:, 0], x[:, 1]) * args.u_0[1] + Uy_bc(x[:, 0], x[:, 1], J1L, gauge, u_right)
-    Sxx = f[:, 2] 
-    Syy = f[:, 3] 
-    Sxy = f[:, 4] * x[:, 0]/x_max[0] * (x_max[0] - x[:, 0])/x_max[0] * x[:, 1]/x_max[1] * (x_max[1] - x[:, 1])/x_max[1]
+    Uy  = f[:, 1] * args.u_0[1] * bc_factor(x[:, 0], x[:, 1], segs_uy, "C0+") + Uy_bc(x[:, 0], x[:, 1], J1L, J1S, J2L, J2S, L, w, U=u_right, coord_normalization=args.coord_normalization)
+    Sxx = f[:, 2] * args.s_0[0] * bc_factor(x[:, 0], x[:, 1], segs_Sxx, "C0+")
+    Syy = f[:, 3] * args.s_0[1] * bc_factor(x[:, 0], x[:, 1], segs_Syy, "C0+") 
+    Sxy = f[:, 4] * args.s_0[2] * bc_factor(x[:, 0], x[:, 1], segs_Sxy, "C0+")
     return dde.backend.stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
 
 def pde(x, f, unknowns=params_factor):
@@ -526,6 +606,7 @@ def log_config(fname):
         "J2S": J2S,
         "J2L": J2L,
         "gauge": gauge,
+        "u_right": u_right,
         # "E_actual": E_actual,
         # "nu_actual": nu_actual,
         # "E_init": E_init,
@@ -534,7 +615,7 @@ def log_config(fname):
         # "nu_final": nu_final,
     }
     data_info = {
-        "num_measurments": (int(np.sqrt(args.num_measurments)))**2,
+        "num_measurments": args.num_measurments,
         "noise_magnitude": args.noise_magnitude,
         "measurments_type": args.measurments_type,
         "DIC_dataset_path": args.DIC_dataset_path,

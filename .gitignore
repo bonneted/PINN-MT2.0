@@ -3,3 +3,4 @@
 1_side_loaded_plate/2_noise_study/results/1noise/*
 1_side_loaded_plate/0_test/*
 1_side_loaded_plate/pinn_inverse_direct.py
+3_iosipescu/0_test/results/*
