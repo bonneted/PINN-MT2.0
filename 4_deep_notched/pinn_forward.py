@@ -64,7 +64,7 @@ parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1],
 parser.add_argument('--coord_normalization', type=bool, default=True, help='Normalize the input coordinates')
 parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
 parser.add_argument('--material_law', choices=['isotropic', 'orthotropic'], default='isotropic', help='Material law')
-parser.add_argument('--corner_eps', type=float, default=0.1, help='Corner epsilon for contact boundary conditions')
+parser.add_argument('--corner_eps', type=float, default=0, help='Corner epsilon for contact boundary conditions')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
@@ -85,12 +85,6 @@ dde.config.set_default_autodiff("forward")
 # =============================================================================
 # 3. Global Constants, Geometry, and Material Parameters
 # =============================================================================
-
-# Create trainable scaling factors (one per parameter)
-params_factor = [dde.Variable(1 / s) for s in args.params_iter_speed]
-trainable_variables = params_factor
-
-
 # Geometry parameters (mm)
 x_max = 100
 y_max = 100
@@ -100,19 +94,17 @@ material_law = args.material_law.lower()
 # Material parameters (converted to N/mm^2)
 if material_law == "isotropic":
     # isotropic plane‐stress
-    E_actual  = 52e3   # Actual Young's modulus 210 GPa = 210e3 N/mm^2
-    nu_actual = 0.3     # Actual Poisson's ratio
-    E_init    = 100e3   # Initial guess for Young's modulus
-    nu_init   = 0.2     # Initial guess for Poisson's ratio
-    params_init = [E_init, nu_init]  # Initial parameters for optimization
-
-    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(E_init, nu_init)):
+    E       = 52e3     # N/mm^2
+    nu      = 0.3
+    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(E, nu)):
         # plane‐stress modified constants
         E, nu = mat_params
+        # lmbd = E * nu / ((1 + nu) * (1 - 2 * nu))
+        # mu = E / (2 * (1 + nu))
 
         σ_xx = E/(1-nu**2)* (eps_xx + nu * eps_yy)
         σ_yy = E/(1-nu**2)* (eps_yy + nu * eps_xx)
-        σ_xy = E/(1+nu) * eps_xy        
+        σ_xy = E/(1+nu) * eps_xy   
 
         return σ_xx, σ_yy, σ_xy
 
@@ -120,9 +112,8 @@ elif material_law == "orthotropic":
     # orthotropic plane‐stress
     Q11, Q22, Q12, Q66 = 41e3, 10.3e3, 3.1e3, 4e3   # N/mm^2
 
-    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(Q11, Q22, Q12, Q66)):
+    def constitutive_stress(eps_xx, eps_yy, eps_xy):
         # plane‐stress modified constants
-        Q11, Q22, Q12, Q66 = mat_params
         σ_xx = Q11*eps_xx + Q12*eps_yy
         σ_yy = Q12*eps_xx + Q22*eps_yy
         σ_xy = 2*Q66*eps_xy
@@ -130,7 +121,7 @@ elif material_law == "orthotropic":
 
 # Load
 pstress = 50.0
-uy_top = pstress * x_max / E_actual  if material_law == 'isotropic' else pstress* x_max / Q22
+uy_top = pstress * x_max / E  if material_law == 'isotropic' else pstress* x_max / Q22
 
 sin = dde.backend.sin
 cos = dde.backend.cos
@@ -160,9 +151,6 @@ def coordMap(x, X_map = X_map_points, Y_map = Y_map_points, x_max = x_max, y_max
     ym = jax.scipy.ndimage.map_coordinates(Y_map,
            [x_pos, y_pos], order=1, mode='nearest')
     return jnp.stack([xm, ym])
-
-def F(x, phys_xy, X_map, Y_map, x_max, y_max, padding):
-    return coordMap(x, X_map, Y_map, x_max, y_max, padding) - phys_xy
 
 def tensMap(tens, x):
     J = jax.jacobian(coordMap)(x)
@@ -430,7 +418,7 @@ def HardBC(x, f):
     return stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
 
 
-def pde(x, f, unknowns=params_factor):
+def pde(x, f):#, unknowns=params_factor):
     x = transform_coords(x)
 
     J_nn = jax.vmap(jax.jacfwd(f[1]))(x)
@@ -443,9 +431,7 @@ def pde(x, f, unknowns=params_factor):
     E_yy = J[:, 1, 1]
     E_xy = 0.5 * (J[:, 0, 1] + J[:, 1, 0])
 
-    param_factors = [u * s for u, s in zip(unknowns, args.params_iter_speed)]
-    mat_params = [f * i for f, i in zip(param_factors, params_init)]
-    S_xx, S_yy, S_xy = constitutive_stress(E_xx, E_yy, E_xy, mat_params)
+    S_xx, S_yy, S_xy = constitutive_stress(E_xx, E_yy, E_xy)
 
     Sxx_x = J[:, 2, 0]
     Syy_y = J[:, 3, 1]
@@ -469,7 +455,7 @@ def input_scaling(x):
         return [x_el / x_max for x_el in x]
     else:
         return x / x_max
-    
+
 # =============================================================================
 # 7. Define Neural Network, Data, and Model
 # =============================================================================
@@ -493,8 +479,8 @@ net.apply_output_transform(HardBC)
 
 model = dde.Model(data, net)
 model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn,
-              external_trainable_variables=trainable_variables)
+              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn)
+              #external_trainable_variables=trainable_variables)
 
 # =============================================================================
 # 8. Setup Callbacks for Logging
@@ -519,9 +505,9 @@ if not os.path.exists(new_folder_path):
 callbacks = []
 if args.available_time:
     callbacks.append(dde.callbacks.Timer(args.available_time))
-callbacks.append(dde.callbacks.VariableValue(params_factor, period=args.log_every,
-                                               filename=os.path.join(new_folder_path, "variables_history.dat"),
-                                               precision=8))
+# callbacks.append(dde.callbacks.VariableValue(params_factor, period=args.log_every,
+#                                                filename=os.path.join(new_folder_path, "variables_history.dat"),
+#                                                precision=8))
 
 # Log the history of the output fields
 def output_log(x, output, field):
@@ -615,7 +601,7 @@ def calc_loss_weights(model):
 # 10. Training
 # =============================================================================
 start_time = time.time()
-print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
+# print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
 # losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbacks, display_every=args.log_every)
 pde_anchors = [[x_all, y_all], [x_notch, y_notch]] # Initial PDE anchors
 if isinstance(args.n_iter, int):
@@ -645,27 +631,27 @@ elapsed = time.time() - start_time
 # =============================================================================
 dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_history.dat"))
 
-params_init = [E_init, nu_init]
-variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
+# params_init = [E_init, nu_init]
+# variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
 
 # Read the variables history
-with open(variables_history_path, "r") as f:
-    lines = f.readlines()
+# with open(variables_history_path, "r") as f:
+#     lines = f.readlines()
 
 # Update the variables history with scaled values
-with open(variables_history_path, "w") as f:
-    for line in lines:
-        step, value = line.strip().split(' ', 1)
-        values = [scale * init * val for scale, init, val in zip(args.params_iter_speed, params_init, eval(value))]
-        f.write(f"{step} " + dde.utils.list_to_str(values, precision=8) + "\n")
+# with open(variables_history_path, "w") as f:
+#     for line in lines:
+#         step, value = line.strip().split(' ', 1)
+#         values = [scale * init * val for scale, init, val in zip(args.params_iter_speed, params_init, eval(value))]
+#         f.write(f"{step} " + dde.utils.list_to_str(values, precision=8) + "\n")
 
 # Read the variables history
-with open(variables_history_path, "r") as f:
-    lines = f.readlines()
+# with open(variables_history_path, "r") as f:
+#     lines = f.readlines()
 # Final E and nu values as the average of the last 10 values 
-E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
-nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
-print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
+# E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
+# nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
+# print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
 
 def log_config(fname):
     """
@@ -707,15 +693,15 @@ def log_config(fname):
         "y_max": y_max,
         "notch_diameter": notch_diameter,
         "material_law": material_law,
-        # "E": E if material_law == "isotropic" else [Q11, Q22, Q12, Q66],
-        # "nu": nu if material_law == "isotropic" else None,
+        "E": E if material_law == "isotropic" else [Q11, Q22, Q12, Q66],
+        "nu": nu if material_law == "isotropic" else None,
         "uy_top": uy_top,
-        "E_actual": E_actual,
-        "nu_actual": nu_actual,
-        "E_init": E_init,
-        "nu_init": nu_init,
-        "E_final": E_final,
-        "nu_final": nu_final,
+        # "E_actual": E_actual,
+        # "nu_actual": nu_actual,
+        # "E_init": E_init,
+        # "nu_init": nu_init,
+        # "E_final": E_final,
+        # "nu_final": nu_final,
     }
     data_info = {
         "num_measurments": args.num_measurments,
