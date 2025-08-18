@@ -2,27 +2,27 @@ import os
 import sys
 import subprocess
 
-executable_name = ["../pinn_forward.py", "../pinn_inverse.py"][0]  
+executable_name = "../pinn_forward.py"
 executable_path = os.path.join(os.path.dirname(__file__), executable_name)
 num_runs = 1
-plate_size = 100
 
 args = {
     # "DIC_dataset_path": r"2_noise_study/data_dic/1noise",
     # "DIC_dataset_number": 1,
-    "n_iter": [10000]*4 + [10000],
-    "n_retrain": 5,
-    "n_adaptive_sample": 10,
+    "n_iter": [10000]*5 + [40000],
+    "n_retrain": 6,
+    "n_adaptive_sample": 20,
     "available_time": 0,
     "num_measurments": [100,100],
     "measurments_type": "displacement",
+    "material_law": ["isotropic","orthotropic"][1],  
     "noise_magnitude": 0,
     "loss_weights": [1,1,1,1,1,1,1,1,1e2,1e2],
-    "results_path": r"0_test/results",
+    "results_path": r"0_forward/results",
     "log_every": 500,
     # "params_iter_speed": [1,1],
     # "stress_integral": True,
-    "num_point_PDE": 100,
+    "num_point_PDE": 250**2,
     # "log_output_fields": [''],
     "corner_eps": 0,  # Angle epsilon for contact boundary conditions
 }
