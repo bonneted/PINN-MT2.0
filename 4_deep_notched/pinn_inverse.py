@@ -71,6 +71,7 @@ parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path t
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
 parser.add_argument('--DIC_dataset_number', type=int, default=1, help='Only for DIC simulated measurements')
 parser.add_argument('--DIC_region', nargs='+', type=float, default=[0, 100, 0, 100], help='Region for DIC measurements [x_min, x_max, y_min, y_max]')
+parser.add_argument('--theta', type=float, default=45.0, help='Rotation angle for orthotropic material in degrees')
 parser.add_argument('--results_path', type=str, default='results_inverse', help='Path to save results')
 
 args = parser.parse_args()
@@ -133,14 +134,44 @@ elif material_law == "orthotropic":
     
     params_init = [Q11_init, Q22_init, Q12_init, Q66_init]  # Initial parameters for optimization
     params_names = ['Q11', 'Q22', 'Q12', 'Q66']
+    theta = np.deg2rad(args.theta)  # Convert angle to radians for calculations
 
-    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(Q11_init, Q22_init, Q12_init, Q66_init)):
-        # plane‐stress modified constants
+    # def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(Q11_init, Q22_init, Q12_init, Q66_init)):
+    #     # plane‐stress modified constants
+    #     Q11, Q22, Q12, Q66 = mat_params
+    #     σ_xx = Q11*eps_xx + Q12*eps_yy
+    #     σ_yy = Q12*eps_xx + Q22*eps_yy
+    #     σ_xy = 2*Q66*eps_xy
+    #     return σ_xx, σ_yy, σ_xy
+    
+    def constitutive_stress(eps_xx, eps_yy, eps_xy,
+                        mat_params=(Q11_init, Q22_init, Q12_init, Q66_init),
+                        theta=theta):
         Q11, Q22, Q12, Q66 = mat_params
-        σ_xx = Q11*eps_xx + Q12*eps_yy
-        σ_yy = Q12*eps_xx + Q22*eps_yy
-        σ_xy = 2*Q66*eps_xy
-        return σ_xx, σ_yy, σ_xy
+
+        # Global strain tensor
+        eps = np.array([[eps_xx, eps_xy],
+                        [eps_xy, eps_yy]])
+
+        # Rotation matrices
+        c, s = np.cos(theta), np.sin(theta)
+        R  = np.array([[c, -s],
+                    [s,  c]])
+        RT = R.T
+
+        # Strain in material coordinates
+        eps_local = RT @ eps @ R
+
+        # Stress in material coordinates (orthotropic)
+        sigma_local = np.array([
+            [Q11*eps_local[0,0] + Q12*eps_local[1,1], 2*Q66*eps_local[0,1]],
+            [2*Q66*eps_local[0,1], Q12*eps_local[0,0] + Q22*eps_local[1,1]]
+        ])
+
+        # Rotate stress back to global coordinates
+        sigma_global = R @ sigma_local @ RT
+
+        return sigma_global[0,0], sigma_global[1,1], sigma_global[0,1]
 
 # Load
 pstress = 50.0
@@ -194,7 +225,7 @@ def calcNormal(x):
 n_rows = 100
 n_cols = 100
 
-FEM_dataset = f"{material_law}_{n_rows}x{n_cols}.dat"
+FEM_dataset = f"{material_law}_{n_rows}x{n_cols}{f'_{theta}deg' if args.material_type == 'orthotropic' else ''}.dat"
 dir_path = os.path.dirname(os.path.realpath(__file__))
 fem_file = os.path.join(dir_path, r"data_fem", FEM_dataset)
 
