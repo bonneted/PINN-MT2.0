@@ -42,6 +42,7 @@ parser.add_argument('--available_time', type=int, default=2, help='Available tim
 parser.add_argument('--log_output_fields', nargs='*', default=['Ux', 'Uy', 'Exx', 'Eyy', 'Exy', 'Sxx', 'Syy', 'Sxy'], help='Fields to log')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--n_retrain', type=int, default=5, help='Number of retraining iterations')
+parser.add_argument('--update_params', nargs='+', type=int, default=1, help='Update parameters during training') 
 parser.add_argument('--n_adaptive_sample', type=int, default=10, help='Number of adaptive sampling points per dimension')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
 parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
@@ -69,6 +70,7 @@ parser.add_argument('--corner_eps', type=float, default=0.1, help='Corner epsilo
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
 parser.add_argument('--DIC_dataset_number', type=int, default=1, help='Only for DIC simulated measurements')
+parser.add_argument('--DIC_region', nargs='+', type=float, default=[0, 100, 0, 100], help='Region for DIC measurements [x_min, x_max, y_min, y_max]')
 parser.add_argument('--results_path', type=str, default='results_inverse', help='Path to save results')
 
 args = parser.parse_args()
@@ -102,10 +104,12 @@ if material_law == "isotropic":
     # isotropic plane‐stress
     E_actual  = 52e3   # Actual Young's modulus 210 GPa = 210e3 N/mm^2
     nu_actual = 0.3     # Actual Poisson's ratio
+    params_actual = [E_actual, nu_actual]  # Actual parameters for optimization
     E_init    = 100e3   # Initial guess for Young's modulus
     nu_init   = 0.2     # Initial guess for Poisson's ratio
     params_init = [E_init, nu_init]  # Initial parameters for optimization
-
+    params_names = ['E', 'nu'] 
+    
     def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(E_init, nu_init)):
         # plane‐stress modified constants
         E, nu = mat_params
@@ -118,9 +122,19 @@ if material_law == "isotropic":
 
 elif material_law == "orthotropic":
     # orthotropic plane‐stress
-    Q11, Q22, Q12, Q66 = 41e3, 10.3e3, 3.1e3, 4e3   # N/mm^2
+    Q11_actual, Q22_actual, Q12_actual, Q66_actual = 41e3, 10.3e3, 3.1e3, 4e3   # N/mm^2
+    params_actual = [Q11_actual, Q22_actual, Q12_actual, Q66_actual]  # Actual parameters for optimization
+    # Q11_init, Q22_init, Q12_init, Q66_init = 60e3, 5e3, 4e3, 2e3  # Initial guesses for orthotropic constants
+    Q11_init = Q22_init = (Q11_actual + Q22_actual) / 2  # Initial guess for Q11 and Q22
+    nu_init = 0.3  # Isotropic initial guess for Poisson's ratio
+    E_init = Q11_init * (1 - nu_init**2)  # Initial guess for Young's modulus based on Q11 and nu
+    Q12_init = Q11_init * nu_init
+    Q66_init = E_init / (2 * (1 + nu_init))  # Initial guess for Q66 based on isotropic assumption
+    
+    params_init = [Q11_init, Q22_init, Q12_init, Q66_init]  # Initial parameters for optimization
+    params_names = ['Q11', 'Q22', 'Q12', 'Q66']
 
-    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(Q11, Q22, Q12, Q66)):
+    def constitutive_stress(eps_xx, eps_yy, eps_xy, mat_params=(Q11_init, Q22_init, Q12_init, Q66_init)):
         # plane‐stress modified constants
         Q11, Q22, Q12, Q66 = mat_params
         σ_xx = Q11*eps_xx + Q12*eps_yy
@@ -130,7 +144,7 @@ elif material_law == "orthotropic":
 
 # Load
 pstress = 50.0
-uy_top = pstress * x_max / E_actual  if material_law == 'isotropic' else pstress* x_max / Q22
+uy_top = pstress * x_max / E_actual  if material_law == 'isotropic' else pstress* x_max / Q22_actual
 
 sin = dde.backend.sin
 cos = dde.backend.cos
@@ -298,9 +312,8 @@ if args.measurments_type == "displacement":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, x_max, args.num_measurments[0]).reshape(-1, 1),
-                       np.linspace(0, y_max, args.num_measurments[1]).reshape(-1, 1)]
-
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                       np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = solution_fn(X_DIC_input)[:, :2]
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
 
@@ -330,8 +343,8 @@ elif args.measurments_type == "strain":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, x_max, args.num_measurments[0]).reshape(-1, 1),
-                       np.linspace(0, y_max, args.num_measurments[1]).reshape(-1, 1)]
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                       np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = strain_fn(X_DIC_input)
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
     DIC_norms = np.mean(np.abs(DIC_data), axis=0) # to normalize the loss
@@ -361,8 +374,8 @@ notch_dist = (y_max - notch_diameter) / 2
 n_pde = int(args.num_point_PDE**0.5)
 x_all = np.linspace(0, x_max, n_pde).reshape(-1, 1)
 y_all = np.linspace(0, y_max, n_pde).reshape(-1, 1)
-x_notch = np.stack((np.linspace(0, 0.2, int(n_pde/2)),
-                    np.linspace(y_max - 0.2, y_max, int(n_pde/2))), axis=0).reshape(-1, 1)
+x_notch = np.stack((np.linspace(0, 0.2*x_max, int(n_pde/2)),
+                    np.linspace(y_max - 0.2*x_max, y_max, int(n_pde/2))), axis=0).reshape(-1, 1)
 y_notch = np.linspace(notch_dist, y_max - notch_dist, n_pde).reshape(-1, 1)
 
 geom = dde.geometry.ListPointCloud([[x_all, y_all], 
@@ -507,7 +520,8 @@ else:
     dic_prefix = ''
     noise_prefix = f"{args.noise_magnitude}noise"
 num_measurments_str = f"{X_DIC_input[0].shape[0]}x{X_DIC_input[1].shape[0]}"
-folder_name = f"{dic_prefix}{args.material_law}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else args.n_iter[0]}{'min' if args.available_time else 'iter'}"
+n_iter_str = sum(args.n_iter) if isinstance(args.n_iter, list) else args.n_iter
+folder_name = f"{dic_prefix}{args.material_law}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else n_iter_str}{'min' if args.available_time else 'iter'}"
 existing_folders = [f for f in os.listdir(results_path) if f.startswith(folder_name)]
 if existing_folders:
     suffixes = [int(f.split("-")[-1]) for f in existing_folders if f != folder_name]
@@ -576,8 +590,13 @@ def adaptive_sampling_grid(domain, n, loss_fun, k=1, c=1, n_grid=200,
 
     return x_sample, y_sample
 
+# def PDE_loss(X):
+#     pde_loss_val = model.predict([X[0], X[1]], operator=pde)
+#     return np.sum(np.abs(pde_loss_val), axis=0)
+
 def PDE_loss(X):
-    pde_loss_val = model.predict([X[0], X[1]], operator=pde)
+    operator = lambda x, f: pde(x, f, [var.value for var in params_factor])
+    pde_loss_val = model.predict([X[0], X[1]], operator=operator)
     return np.sum(np.abs(pde_loss_val), axis=0)
 
 # =============================================================================
@@ -615,13 +634,15 @@ def calc_loss_weights(model):
 # 10. Training
 # =============================================================================
 start_time = time.time()
-print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
-# losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbacks, display_every=args.log_every)
+# print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
+print(f"Material law: {material_law}")
+print([f"{p_name}: {p_init * p.value * p_speed:.3f}" for p_name, p_init, p, p_speed in zip(params_names, params_init, params_factor, args.params_iter_speed)])
 pde_anchors = [[x_all, y_all], [x_notch, y_notch]] # Initial PDE anchors
 if isinstance(args.n_iter, int):
-    n_iter = [args.n_iter] * args.n_retrain
-else:
-    n_iter = args.n_iter
+    args.n_iter = [args.n_iter] * args.n_retrain
+if not isinstance(args.update_params, list):
+    args.update_params = [args.update_params] * args.n_retrain
+
 for i in range(args.n_retrain):
     if i > 0:
         x_sample, y_sample = adaptive_sampling_grid(domain,
@@ -632,11 +653,17 @@ for i in range(args.n_retrain):
 
         loss_weights_grads, loss_grads = calc_loss_weights(model)
         new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
-        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-                      loss_weights=new_loss_weights, loss=args.loss_fn)
-        print(f"Retraining {i+1}/{args.n_retrain} adding {x_sample.shape[0]**2} points")
 
-    losshistory, train_state = model.train(iterations=n_iter[i], callbacks=callbacks, display_every=args.log_every)
+        trainable_variables_i = trainable_variables if args.update_params[i] else None 
+        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+                      loss_weights=new_loss_weights, loss=args.loss_fn,external_trainable_variables=trainable_variables_i)
+        print(f"Retraining {i+1}/{args.n_retrain} adding {x_sample.shape[0]**2} points")
+    else:
+        trainable_variables_i = trainable_variables if args.update_params[i] else None 
+        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+                        loss_weights=args.loss_weights, loss=args.loss_fn, external_trainable_variables=trainable_variables_i)
+
+    losshistory, train_state = model.train(iterations=args.n_iter[i], callbacks=callbacks, display_every=args.log_every)
 
 elapsed = time.time() - start_time
 
@@ -645,7 +672,7 @@ elapsed = time.time() - start_time
 # =============================================================================
 dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_history.dat"))
 
-params_init = [E_init, nu_init]
+# params_init = [E_init, nu_init]
 variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
 
 # Read the variables history
@@ -662,10 +689,12 @@ with open(variables_history_path, "w") as f:
 # Read the variables history
 with open(variables_history_path, "r") as f:
     lines = f.readlines()
-# Final E and nu values as the average of the last 10 values 
-E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
-nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
-print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
+# Final parameters values as the average of the last 10 values 
+params_final = [np.mean([eval(line.strip().split(' ', 1)[1])[i] for line in lines[-10:]]) for i in range(len(params_init))]
+print(f"Final parameters:" + ", ".join([f"{p_name}: {p_final:.3f}" for p_name, p_final in zip(params_names, params_final)]))
+# E_final = np.mean([eval(line.strip().split(' ', 1)[1])[0] for line in lines[-10:]])
+# nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
+# print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
 
 def log_config(fname):
     """
@@ -701,6 +730,12 @@ def log_config(fname):
         "params_iter_speed": args.params_iter_speed,
         "u_0": args.u_0,
         "logged_fields": args.log_output_fields,
+        "n_iter": args.n_iter,
+        "n_retrain": args.n_retrain,
+        "update_params": args.update_params,
+        "log_every": args.log_every,
+        "available_time": args.available_time,
+        "coord_normalization": args.coord_normalization,
     }
     problem_info = {
         "x_max": x_max,
@@ -710,12 +745,16 @@ def log_config(fname):
         # "E": E if material_law == "isotropic" else [Q11, Q22, Q12, Q66],
         # "nu": nu if material_law == "isotropic" else None,
         "uy_top": uy_top,
-        "E_actual": E_actual,
-        "nu_actual": nu_actual,
-        "E_init": E_init,
-        "nu_init": nu_init,
-        "E_final": E_final,
-        "nu_final": nu_final,
+        # "E_actual": E_actual,
+        # "nu_actual": nu_actual,
+        # "E_init": E_init,
+        # "nu_init": nu_init,
+        # "E_final": E_final,
+        # "nu_final": nu_final,
+        "params_names": params_names,
+        "params_init": params_init,
+        "params_actual": params_actual,
+        "params_final": params_final,
     }
     data_info = {
         "num_measurments": args.num_measurments,

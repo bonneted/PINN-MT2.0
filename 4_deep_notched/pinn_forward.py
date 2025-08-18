@@ -49,7 +49,7 @@ parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of 
 parser.add_argument('--num_point_test', type=int, default=10000, help='Number of test points')
 
 parser.add_argument('--net_width', type=int, default=32, help='Width of the network')
-parser.add_argument('--net_depth', type=int, default=5, help='Depth of the network')
+parser.add_argument('--net_depth', type=int, default=3, help='Depth of the network')
 parser.add_argument('--activation', choices=['tanh', 'relu', 'elu'], default='tanh', help='Activation function')
 parser.add_argument('--optimizer', choices=['adam'], default='adam', help='Optimizer')
 parser.add_argument('--mlp', choices=['mlp', 'modified_mlp'], default='mlp', help='Type of MLP for SPINN')
@@ -349,8 +349,8 @@ notch_dist = (y_max - notch_diameter) / 2
 n_pde = int(args.num_point_PDE**0.5)
 x_all = np.linspace(0, x_max, n_pde).reshape(-1, 1)
 y_all = np.linspace(0, y_max, n_pde).reshape(-1, 1)
-x_notch = np.stack((np.linspace(0, 0.2, int(n_pde/2)),
-                    np.linspace(y_max - 0.2, y_max, int(n_pde/2))), axis=0).reshape(-1, 1)
+x_notch = np.stack((np.linspace(0, 0.2*x_max, int(n_pde/2)),
+                    np.linspace(y_max - 0.2*x_max, y_max, int(n_pde/2))), axis=0).reshape(-1, 1)
 y_notch = np.linspace(notch_dist, y_max - notch_dist, n_pde).reshape(-1, 1)
 
 geom = dde.geometry.ListPointCloud([[x_all, y_all], 
@@ -479,7 +479,7 @@ net.apply_output_transform(HardBC)
 
 model = dde.Model(data, net)
 model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn)
+              loss_weights=args.loss_weights, loss=args.loss_fn)
               #external_trainable_variables=trainable_variables)
 
 # =============================================================================
@@ -709,7 +709,7 @@ def log_config(fname):
         "measurments_type": args.measurments_type,
         "DIC_dataset_path": args.DIC_dataset_path,
         "DIC_dataset_number": args.DIC_dataset_number,
-        "FEM_dataset": args.FEM_dataset, 
+        "FEM_dataset": FEM_dataset, 
     }
     info = {"system": system_info, "gpu": gpu_info, "execution": execution_info,
             "network": network_info, "problem": problem_info, "data": data_info}
