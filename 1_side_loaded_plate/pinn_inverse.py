@@ -40,7 +40,7 @@ parser.add_argument('--available_time', type=int, default=2, help='Available tim
 parser.add_argument('--log_output_fields', nargs='*', default=['Ux', 'Uy', 'Exx', 'Eyy', 'Exy', 'Sxx', 'Syy', 'Sxy'], help='Fields to log')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
-parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
+parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1], help='Loss weights')
 parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of collocation points for PDE evaluation')
 parser.add_argument('--num_point_test', type=int, default=100000, help='Number of test points')
 
@@ -51,13 +51,15 @@ parser.add_argument('--optimizer', choices=['adam'], default='adam', help='Optim
 parser.add_argument('--mlp', choices=['mlp', 'modified_mlp'], default='mlp', help='Type of MLP for SPINN')
 parser.add_argument('--initialization', choices=['Glorot uniform', 'He normal'], default='Glorot uniform', help='Initialization method')
 
+parser.add_argument('--DIC_region', nargs='+', type=float, default=[0, 1, 0, 1], help='Region for DIC measurements in relative coordinates')
 parser.add_argument('--measurments_type', choices=['displacement','strain'], default='strain', help='Type of measurements')
-parser.add_argument('--num_measurments', type=int, default=16, help='Number of measurements (should be a perfect square)')
+parser.add_argument('--num_measurments',nargs='+', type=int, default=[4, 4], help='Number of measurements (should be a perfect square)')
 parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussian noise magnitude (not for DIC simulated)')
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
-parser.add_argument('--coord_normalization', type=bool, default=False, help='Normalize the input coordinates')
+parser.add_argument('--coord_normalization', type=int, default=0, help='Normalize the input coordinates')
 parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
+parser.add_argument('--stress_BC', type=bool, default=True, help='Impose stress BC on the loaded edge')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
@@ -86,6 +88,7 @@ else : # Realistic DIC experiment (100x100mm plate)
     L_max = 100.0 # Plate width in mm
     m, b  = 0.3, 50 # Side-load parameters 0.3 N/mm, 50 N
 
+args.DIC_region = [bound*L_max for bound in args.DIC_region]
 x_max = 1.0 if args.coord_normalization else L_max
 if args.coord_normalization:
     m *= L_max
@@ -155,17 +158,22 @@ integral_points = [x_integral.reshape(-1,1), y_integral.reshape(-1,1)]
 
 def integral_stress(x, outputs, X):
     x = transform_coords(x)
+    # if args.coord_normalization:
+    #     x *= jnp.array([L_max, L_max])  # denormalize coordinates
     y_grid = x[:, 1].reshape((n_integral, n_integral))
     Sxx = outputs[0][:, 2].reshape((n_integral, n_integral))
     return jnp.trapezoid(Sxx, y_grid, axis=1)
 
-Integral_BC = dde.PointSetOperatorBC(integral_points, (b+m*L_max/2) * L_max, integral_stress)
-bcs = [Integral_BC]
+if args.stress_integral:
+    Integral_BC = dde.PointSetOperatorBC(integral_points, (b+m*L_max/2) * L_max, integral_stress)
+    bcs = [Integral_BC]
+else:
+    bcs = []
 
 # =============================================================================
 # 5.2 Setup Measurement Data Based on Type (Displacement, Strain, DIC)
 # =============================================================================
-args.num_measurments = int(np.sqrt(args.num_measurments))**2
+# args.num_measurments = int(np.sqrt(args.num_measurments))**2
 if args.measurments_type == "displacement":
     if args.DIC_dataset_path != "no_dataset":
         dic_path = os.path.join(dir_path, args.DIC_dataset_path)
@@ -178,11 +186,12 @@ if args.measurments_type == "displacement":
         x_values = np.mean(X_dic, axis=0).reshape(-1, 1)
         y_values = np.mean(Y_dic, axis=1).reshape(-1, 1)
         X_DIC_input = [x_values, y_values]
-        if args.num_measurments != x_values.shape[0] * y_values.shape[0]:
-            print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
-            args.num_measurments = x_values.shape[0] * y_values.shape[0]
+        if args.num_measurments[0] * args.num_measurments[1] != x_values.shape[0] * y_values.shape[0]:
+            print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0]} x {y_values.shape[0]}")
+            args.num_measurments = [x_values.shape[0], y_values.shape[0]]
     else:
-        X_DIC_input = [np.linspace(0, L_max, args.num_measurments).reshape(-1, 1)] * 2
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                       np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = solution_fn(X_DIC_input)[:, :2]
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
 
@@ -212,7 +221,8 @@ elif args.measurments_type == "strain":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, L_max, args.num_measurments).reshape(-1, 1)] * 2
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = strain_fn(X_DIC_input)
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
     DIC_norms = np.mean(np.abs(DIC_data), axis=0) # to normalize the loss
@@ -249,7 +259,7 @@ def HardBC(x, f, x_max=x_max):
         x = transform_coords(x)
     Ux  = f[:, 0] * x[:, 0]/x_max * args.u_0[0] 
     Uy  = f[:, 1] * x[:, 1]/x_max * args.u_0[1]
-    Sxx = f[:, 2] if args.stress_integral else f[:, 2] * (x_max - x[:, 0])/x_max + side_load(x[:, 1])
+    Sxx = f[:, 2] if args.stress_BC else f[:, 2] * (x_max - x[:, 0])/x_max + side_load(x[:, 1])
     Syy = f[:, 3] * (x_max - x[:, 1])/x_max
     Sxy = f[:, 4] * x[:, 0]/x_max * (x_max - x[:, 0])/x_max * x[:, 1]/x_max * (x_max - x[:, 1])/x_max
     return dde.backend.stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
@@ -300,7 +310,7 @@ def input_scaling(x):
 # =============================================================================
 layers = [2] + [args.net_width] * args.net_depth + [5]
 net = dde.nn.SPINN(layers, args.activation, args.initialization, args.mlp)
-batch_size = args.num_point_PDE + args.num_measurments
+batch_size = args.num_point_PDE + args.num_measurments[0]*args.num_measurments[1] + (n_integral if args.stress_integral else 0)
 num_params = sum(p.size for p in jax.tree.leaves(net.init(jax.random.PRNGKey(0), jnp.ones(layers[0]))))
 
 data = dde.data.PDE(
@@ -372,7 +382,14 @@ for i, field in enumerate(args.log_output_fields): # Log output fields
 # 9. Calculate Loss Weights based on the Gradient of the Loss Function
 # =============================================================================
 from jax.flatten_util import ravel_pytree
-def loss_function(params,comp=0,inputs=[X_DIC_input]*(len(bcs)-1)+[integral_points]+[X_plot]):
+bc_anchors = [integral_points] if args.stress_integral else []
+bc_anchors += [X_DIC_input] * (len(bcs) - (1 if args.stress_integral else 0))
+   
+# bc_anchors = [X_DIC_input, X_DIC_input]
+pde_anchors = [X_plot]
+all_anchors = bc_anchors + pde_anchors
+
+def loss_function(params,comp=0,inputs=all_anchors):
     return model.outputs_losses_train(params, inputs, None)[1][comp]
 
 n_loss = len(args.loss_weights)
@@ -476,7 +493,8 @@ def log_config(fname):
         "nu_final": nu_final,
     }
     data_info = {
-        "num_measurments": (int(np.sqrt(args.num_measurments)))**2,
+        "DIC_region": args.DIC_region,
+        "num_measurments": args.num_measurments,
         "noise_magnitude": args.noise_magnitude,
         "measurments_type": args.measurments_type,
         "DIC_dataset_path": args.DIC_dataset_path,
