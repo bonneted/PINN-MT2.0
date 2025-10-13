@@ -23,6 +23,7 @@ from typing import List, Tuple, Literal
 # =============================================================================
 # 1. Utility Function: Coordinate Transformation for SPINN
 # =============================================================================
+@dde.utils.list_handler
 def transform_coords(x):
     """
     For SPINN, if the input x is provided as a list of 1D arrays (e.g., [X_coords, Y_coords]),
@@ -35,11 +36,14 @@ def transform_coords(x):
 # 2. Parse Arguments
 # =============================================================================
 parser = argparse.ArgumentParser(description="Physics Informed Neural Networks for Linear Elastic Plate")
-parser.add_argument('--n_iter', type=int, default=int(1e10), help='Number of iterations')
+parser.add_argument('--n_iter', nargs='+', type=int, default=int(1e10), help='Number of iterations')
 parser.add_argument('--log_every', type=int, default=250, help='Log every n steps')
 parser.add_argument('--available_time', type=int, default=2, help='Available time in minutes')
 parser.add_argument('--log_output_fields', nargs='*', default=['Ux', 'Uy', 'Exx', 'Eyy', 'Exy', 'Sxx', 'Syy', 'Sxy'], help='Fields to log')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--n_retrain', type=int, default=5, help='Number of retraining iterations')
+parser.add_argument('--update_params', nargs='+', type=int, default=1, help='Update parameters during training') 
+parser.add_argument('--n_adaptive_sample', type=int, default=10, help='Number of adaptive sampling points per dimension')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
 parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
 parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of collocation points for PDE evaluation')
@@ -121,8 +125,8 @@ elif args.material_law.lower() == "orthotropic":
         return σ_xx, σ_yy, σ_xy
 
 # Create trainable scaling factors (one per parameter)
-params_factor = [dde.Variable(1 / s) for s in args.params_iter_speed]
-trainable_variables = params_factor
+# params_factor = [dde.Variable(1 / s) for s in args.params_iter_speed]
+# trainable_variables = params_factor
 
 # =============================================================================
 # 4. Load FEM Data and Build Interpolation Functions
@@ -274,6 +278,31 @@ args.u_0 = [disp_norms[i] if not args.u_0[i] else args.u_0[i] for i in range(2)]
 # Define the domain geometry
 geom = dde.geometry.Rectangle([0, 0], [L, w])
 
+n_pde = 200
+x_train = np.linspace(0, x_max[0], n_pde).reshape(-1, 1)
+y_train = np.linspace(0, x_max[1], n_pde).reshape(-1, 1)
+
+margin = 0.2
+x_top_left = np.linspace((1-margin)*J1S/L* x_max[0], (1+margin)*J1S/L* x_max[0], int(n_pde/4)).reshape(-1, 1)
+y_top_left = np.linspace((1-margin)*x_max[1], x_max[1], int(n_pde/4)).reshape(-1, 1)
+
+x_top_right = np.linspace((1-margin)*(L-J2L)/L* x_max[0], (1+margin)*(L-J2L)/L* x_max[0], int(n_pde/4)).reshape(-1, 1)
+y_top_right = np.linspace((1-margin)*x_max[1], x_max[1], int(n_pde/4)).reshape(-1, 1)
+
+x_bottom_left = np.linspace((1-margin)*J1L/L* x_max[0], (1+margin)*J1L/L* x_max[0], int(n_pde/4)).reshape(-1, 1)
+y_bottom_left = np.linspace(0, margin*x_max[1], int(n_pde/4)).reshape(-1, 1)
+
+x_bottom_right = np.linspace((1-margin)*(L-J2S)/L* x_max[0], (1+margin)*(L-J2S)/L* x_max[0], int(n_pde/4)).reshape(-1, 1)
+y_bottom_right = np.linspace(0, margin*x_max[1], int(n_pde/4)).reshape(-1, 1)
+
+all_anchor_points = [[x_train, y_train], 
+                    [x_top_left, y_top_left], 
+                    [x_top_right, y_top_right], 
+                    [x_bottom_left, y_bottom_left], 
+                    [x_bottom_right, y_bottom_right]]
+
+geom = dde.geometry.ListPointCloud(all_anchor_points)
+
 def bc_factor(
     x1: jnp.ndarray,
     x2: jnp.ndarray,
@@ -392,7 +421,7 @@ def HardBC(x, f, all_segs=all_segs):
     Sxy = f[:, 4] * args.s_0[2] * bc_factor(x[:, 0], x[:, 1], segs_Sxy, "C0+")
     return dde.backend.stack((Ux, Uy, Sxx, Syy, Sxy), axis=1)
 
-def pde(x, f, unknowns=params_factor):
+def pde(x, f):#, unknowns=params_factor):
     """
     Define the PDE residuals for the linear elastic plate.
     """
@@ -449,8 +478,8 @@ net.apply_output_transform(HardBC)
 
 model = dde.Model(data, net)
 model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn,
-              external_trainable_variables=trainable_variables)
+              loss_weights=[1]*len(args.loss_weights), loss=args.loss_fn)
+            #   external_trainable_variables=trainable_variables)
 
 # =============================================================================
 # 8. Setup Callbacks for Logging
@@ -463,7 +492,8 @@ else:
     dic_prefix = ''
     noise_prefix = f"{args.noise_magnitude}noise"
 num_measurments_str = f"{X_DIC_input[0].shape[0]}x{X_DIC_input[1].shape[0]}"
-folder_name = f"{dic_prefix}{args.measurments_type}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else args.n_iter}{'min' if args.available_time else 'iter'}"
+n_iter_str = sum(args.n_iter) if isinstance(args.n_iter, list) else args.n_iter
+folder_name = f"{dic_prefix}{args.measurments_type}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else n_iter_str}{'min' if args.available_time else 'iter'}"
 existing_folders = [f for f in os.listdir(results_path) if f.startswith(folder_name)]
 if existing_folders:
     suffixes = [int(f.split("-")[-1]) for f in existing_folders if f != folder_name]
@@ -475,9 +505,9 @@ if not os.path.exists(new_folder_path):
 callbacks = []
 if args.available_time:
     callbacks.append(dde.callbacks.Timer(args.available_time))
-callbacks.append(dde.callbacks.VariableValue(params_factor, period=args.log_every,
-                                               filename=os.path.join(new_folder_path, "variables_history.dat"),
-                                               precision=8))
+# callbacks.append(dde.callbacks.VariableValue(params_factor, period=args.log_every,
+                                            #    filename=os.path.join(new_folder_path, "variables_history.dat"),
+                                            #    precision=8))
 
 # Log the history of the output fields
 def output_log(x, output, field):
@@ -521,18 +551,84 @@ def calc_loss_weights(model):
     loss_weights_grads = jnp.sqrt(jnp.sum(loss_grads)/loss_grads) # Caution: ad-hoc sqrt
     return loss_weights_grads, loss_grads
 
-loss_weights_grads, loss_grads = calc_loss_weights(model)
-new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
-model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
-              loss_weights=new_loss_weights, loss=args.loss_fn,
-              external_trainable_variables=trainable_variables)
+# loss_weights_grads, loss_grads = calc_loss_weights(model)
+# new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
+# model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+#               loss_weights=new_loss_weights, loss=args.loss_fn)
+            #   external_trainable_variables=trainable_variables)
+# =============================================================================
+# 9.1 Adaptive sampling
+# =============================================================================
+domain = np.array([[0, x_max[0]], [0, x_max[1]]])
+def adaptive_sampling_grid(domain, n, loss_fun, k=1, c=1, n_grid=200, 
+                            random_state=None):
+    """
+    Choose n x-coordinates and n y-coordinates so that the n×n grid they
+    generate (via Cartesian product) lies in the regions of highest loss.
+    """
+    rng = np.random.default_rng(random_state)
+
+    # Build a random trial grid of shape (n_rand, n_rand)
+    x_trial = rng.uniform(domain[0, 0], domain[0, 1], n_grid).reshape(-1, 1)  
+    y_trial = rng.uniform(domain[1, 0], domain[1, 1], n_grid).reshape(-1, 1)
+
+    # Evaluate the loss on every grid point
+    loss_flat = loss_fun([x_trial, y_trial])
+    loss = loss_flat.reshape(n_grid, n_grid)
+
+    # Convert the loss into row / column scores
+    weight = (loss ** k) / np.mean(loss ** k) + c    # emphasise large losses
+    row_scores = weight.sum(axis=1)                  # shape (n_rand,)
+    col_scores = weight.sum(axis=0)                  # shape (n_rand,)
+
+    row_idx = np.argsort(-row_scores)[:n]
+    col_idx = np.argsort(-col_scores)[:n]
+
+    x_sample = np.sort(x_trial[row_idx])   # sort for nicer grids / plots
+    y_sample = np.sort(y_trial[col_idx])
+
+    return x_sample, y_sample
+
+def PDE_loss(X):
+    operator = lambda x, f: pde(x, f)#, [var.value for var in params_factor])
+    pde_loss_val = model.predict([X[0], X[1]], operator=operator)
+    return np.sum(np.abs(pde_loss_val), axis=0)
+
 
 # =============================================================================
 # 10. Training
 # =============================================================================
 start_time = time.time()
 # print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
-losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbacks, display_every=args.log_every)
+print(f"Material law: {args.material_law}")
+# print([f"{p_name}: {p_init * p.value * p_speed:.3f}" for p_name, p_init, p, p_speed in zip(params_names, params_init, params_factor, args.params_iter_speed)])
+if isinstance(args.n_iter, int):
+    args.n_iter = [args.n_iter] * args.n_retrain
+if not isinstance(args.update_params, list):
+    args.update_params = [args.update_params] * args.n_retrain
+
+for i in range(args.n_retrain):
+    if i > 0:
+        x_sample, y_sample = adaptive_sampling_grid(domain,
+                                                    n=args.n_adaptive_sample,
+                                                    loss_fun=PDE_loss)
+        all_anchor_points += [[x_sample, y_sample]]
+        data.replace_with_anchors(all_anchor_points)
+
+        loss_weights_grads, loss_grads = calc_loss_weights(model)
+        new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
+
+        # trainable_variables_i = trainable_variables if args.update_params[i] else None 
+        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+                      loss_weights=new_loss_weights, loss=args.loss_fn)#,external_trainable_variables=trainable_variables_i)
+        print(f"Retraining {i+1}/{args.n_retrain} adding {x_sample.shape[0]**2} points")
+    else:
+        # trainable_variables_i = trainable_variables if args.update_params[i] else None 
+        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+                        loss_weights=args.loss_weights, loss=args.loss_fn)#, external_trainable_variables=trainable_variables_i)
+
+    losshistory, train_state = model.train(iterations=args.n_iter[i], callbacks=callbacks, display_every=args.log_every)
+
 elapsed = time.time() - start_time
 
 # =============================================================================
@@ -541,7 +637,7 @@ elapsed = time.time() - start_time
 dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_history.dat"))
 
 # params_init = [E_init, nu_init]
-variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
+# variables_history_path = os.path.join(new_folder_path, "variables_history.dat")
 
 # Read the variables history
 # with open(variables_history_path, "r") as f:
@@ -596,6 +692,14 @@ def log_config(fname):
         "params_iter_speed": args.params_iter_speed,
         "u_0": args.u_0,
         "logged_fields": args.log_output_fields,
+        "n_iter": args.n_iter,
+        "n_retrain": args.n_retrain,
+        "n_adaptive_sample": args.n_adaptive_sample,
+        "log_every": args.log_every,
+        "loss_function": args.loss_fn,
+        "coord_normalization": args.coord_normalization,
+        "available_time": args.available_time,
+        "update_params": args.update_params,
     }
     problem_info = {
         "L": L,

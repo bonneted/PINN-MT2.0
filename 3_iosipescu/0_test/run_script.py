@@ -7,21 +7,23 @@ num_runs = 1
 material_law = 'orthotropic' #'orthotropic'
 # nrows, ncols = 75, 285
 nrows, ncols = 100, 120
+n_retrain = 5
 
 args = {
     "FEM_dataset": f"{material_law}_{nrows}x{ncols}.dat",
     "coord_normalization": False,
     # "DIC_dataset_path": r"2_noise_study/data_dic/1noise",
     # "DIC_dataset_number": 1,
-    "n_iter": 1000000,
-    "available_time": 3,
+    "n_retrain": n_retrain,
+    "n_iter": [10]*(n_retrain-1) + [100000],
+    "available_time": 0,
     "log_every": 250,
-    "num_measurments": [50,50],
+    "num_measurments": [40,50],
     "measurments_type": "displacement",
     "noise_magnitude": 0,
     "loss_weights": [1,1,1,1,1,1e2,1e2],
     "results_path": r"0_test/results",
-    "log_every": 500,
+    "log_every": 200,
     "params_iter_speed": [1,1],
     "stress_integral": True,
     "num_point_PDE": 300**2,
