@@ -10,10 +10,11 @@ args = {
     "available_time": 2,
     "measurments_type": "strain",
     "noise_magnitude": 1e-6,
-    "loss_weights": [1,1,1,1,1,1e2,1e2],
+    "loss_weights": [1,1,1,1,1,1e2,1e2,1e2],
     "results_path": "1_comparison_Martins2019/results",
     "log_every": 250,
     # "log_output_fields": [''],
+    "stress_integral": False,
 }
 
 # Flatten the args dictionary into a list of command line arguments
