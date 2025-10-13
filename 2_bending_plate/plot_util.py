@@ -291,9 +291,9 @@ def plot_field_columns(fig, ax, fields, fields_id, iteration, Xmesh, Ymesh, func
     
     return ims_ref, ims_field, ims_res
 
-def animate_frame(i, ims_field, ims_res, line_param1, line_param2, scatter_param1, scatter_param2, ax_variables,
-                  lines, scatters, steps, time_unit, step_type, param1_history, param2_history, 
-                  param1_actual, param2_actual, param1_name, param2_name, metrics, fields, func, Xmesh, Ymesh, field_names, fields_id):
+def animate_frame(i, ims_field, ims_res, line_param1, scatter_param1, ax_variables,
+                  lines, scatters, steps, time_unit, step_type, param1_history, 
+                  param1_actual, param1_name, metrics, fields, func, Xmesh, Ymesh, field_names, fields_id):
     """
     Update function for animation frames. This updates parameter plots, metric plots,
     and field (with residual) plots for the given frame index.
@@ -325,9 +325,9 @@ def animate_frame(i, ims_field, ims_res, line_param1, line_param2, scatter_param
     plt.suptitle(f"{step_type}: {steps[i]:.0f}{f' {time_unit}' if step_type=='time' else ''}", fontsize=16)
     
     # Update parameter evolution plots
-    line_param1, line_param2, scatter_param1, scatter_param2, ax_variables = update_variables(
-        i, line_param1, line_param2, scatter_param1, scatter_param2, ax_variables,
-        steps, param1_history, param2_history, param1_actual, param2_actual, param1_name, param2_name)
+    line_param1, scatter_param1, ax_variables = update_variable(
+        i, line_param1, scatter_param1, ax_variables,
+        steps, param1_history, param1_actual, param1_name)
     
     # Update metric plots
     lines, scatters = update_metrics(i, lines, scatters, steps, metrics)
@@ -342,8 +342,8 @@ def animate_frame(i, ims_field, ims_res, line_param1, line_param2, scatter_param
         ims_res[idx].set_array(field_diff.ravel())
         norm = colors.Normalize(vmin=field_diff.min(), vmax=field_diff.max())
         ims_res[idx].set_norm(norm)
-    
-    return ims_field, ims_res, line_param1, line_param2, scatter_param1, scatter_param2, ax_variables, lines, scatters
+
+    return ims_field, ims_res, line_param1, scatter_param1, ax_variables, lines, scatters
 
 def moving_average(arr, window_size):
     window = np.ones(window_size) / window_size

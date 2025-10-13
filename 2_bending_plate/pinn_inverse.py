@@ -72,13 +72,13 @@ dde.config.set_default_autodiff("forward")
 # 3. Global Constants, Geometry, and Material Parameters
 # =============================================================================
 L_max = 1.0  # Length of the square plate
-E_actual = 1  # Young's modulus (Pa)
+E_actual = 1e9  # Young's modulus (Pa)
 nu_actual = 0.3  # Poisson's ratio
 t = 1e-3  # Plate thickness (m)
-q = t**3  # Uniform load (Pa)
+q = 1  # Uniform load (Pa)
 w0 = 1e-2 # Order of magnitude of the displacement
 
-E_init = 0.6 # Initial guess for Young's modulus
+E_init = 0.6e9 # Initial guess for Young's modulus
 nu_init = 0.2  # Initial guess for Poisson's ratio
 
 D_init = E_init * t**3 / (12 * (1 - nu_init**2))  # Initial flexural rigidity
