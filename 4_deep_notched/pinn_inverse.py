@@ -145,33 +145,34 @@ elif material_law == "orthotropic":
     #     return σ_xx, σ_yy, σ_xy
     
     def constitutive_stress(eps_xx, eps_yy, eps_xy,
-                        mat_params=(Q11_init, Q22_init, Q12_init, Q66_init),
-                        theta=theta):
+                            mat_params=(Q11_init, Q22_init, Q12_init, Q66_init),
+                            theta=theta):
         Q11, Q22, Q12, Q66 = mat_params
 
-        # Global strain tensor
-        eps = np.array([[eps_xx, eps_xy],
-                        [eps_xy, eps_yy]])
+        # (N,2,2) strain tensor from 3 components
+        eps = jnp.stack([eps_xx, eps_xy, eps_xy, eps_yy], axis=-1).reshape(-1, 2, 2)
 
-        # Rotation matrices
-        c, s = np.cos(theta), np.sin(theta)
-        R  = np.array([[c, -s],
-                    [s,  c]])
+        # Rotation matrices (2,2)
+        c, s = jnp.cos(theta), jnp.sin(theta)
+        R  = jnp.array([[c, -s],
+                        [s,  c]])
         RT = R.T
 
-        # Strain in material coordinates
-        eps_local = RT @ eps @ R
+        # Rotate strain: eps_local = RT @ eps @ R   (N,2,2)
+        eps_local = jnp.einsum('ij,njk,kl->nil', RT, eps, R)
 
-        # Stress in material coordinates (orthotropic)
-        sigma_local = np.array([
-            [Q11*eps_local[0,0] + Q12*eps_local[1,1], 2*Q66*eps_local[0,1]],
-            [2*Q66*eps_local[0,1], Q12*eps_local[0,0] + Q22*eps_local[1,1]]
-        ])
+        # Stress in material coordinates (N,2,2), directly built with reshape
+        sigma_local = jnp.stack([
+            Q11*eps_local[:,0,0] + Q12*eps_local[:,1,1],   # σ11
+            2*Q66*eps_local[:,0,1],                        # σ12
+            2*Q66*eps_local[:,0,1],                        # σ21
+            Q12*eps_local[:,0,0] + Q22*eps_local[:,1,1]    # σ22
+        ], axis=-1).reshape(-1, 2, 2)
 
-        # Rotate stress back to global coordinates
-        sigma_global = R @ sigma_local @ RT
+        # Rotate back to global
+        sigma_global = jnp.einsum('ij,njk,kl->nil', R, sigma_local, RT)
 
-        return sigma_global[0,0], sigma_global[1,1], sigma_global[0,1]
+        return sigma_global[:,0,0], sigma_global[:,1,1], sigma_global[:,0,1]
 
 # Load
 pstress = 50.0
@@ -206,9 +207,6 @@ def coordMap(x, X_map = X_map_points, Y_map = Y_map_points, x_max = x_max, y_max
            [x_pos, y_pos], order=1, mode='nearest')
     return jnp.stack([xm, ym])
 
-def F(x, phys_xy, X_map, Y_map, x_max, y_max, padding):
-    return coordMap(x, X_map, Y_map, x_max, y_max, padding) - phys_xy
-
 def tensMap(tens, x):
     J = jax.jacobian(coordMap)(x)
     J_inv = jnp.linalg.inv(J)
@@ -225,7 +223,7 @@ def calcNormal(x):
 n_rows = 100
 n_cols = 100
 
-FEM_dataset = f"{material_law}_{n_rows}x{n_cols}{f'_{theta}deg' if args.material_type == 'orthotropic' else ''}.dat"
+FEM_dataset = f"{material_law}_{n_rows}x{n_cols}{f'_{args.theta}deg' if material_law == 'orthotropic' else ''}.dat"
 dir_path = os.path.dirname(os.path.realpath(__file__))
 fem_file = os.path.join(dir_path, r"data_fem", FEM_dataset)
 
@@ -460,8 +458,8 @@ segs_Sxy = [
 def HardBC(x, f):
     if isinstance(x, list):
         x = transform_coords(x)
-    if args.coord_normalization:
-        x *= jnp.array([x_max, y_max])  # Normalize coordinates to [0, 1]
+    # if args.coord_normalization:
+    #     x *= jnp.array([x_max, y_max])  # denormalize coordinates
     x_mapped = jax.vmap(coordMap)(x)
 
     Ux = f[:, 0] * x[:, 1] / y_max * (y_max - x[:, 1]) / y_max * args.u_0[0]
@@ -510,10 +508,10 @@ def input_scaling(x):
     Scale the input coordinates to the range [0, 1].
     """
     if isinstance(x, list):
-        return [x_el / x_max for x_el in x]
+        return [x[0]/x_max, x[1]/y_max]
     else:
-        return x / x_max
-    
+        return x / np.array([x_max, y_max])
+
 # =============================================================================
 # 7. Define Neural Network, Data, and Model
 # =============================================================================
@@ -786,6 +784,7 @@ def log_config(fname):
         "params_init": params_init,
         "params_actual": params_actual,
         "params_final": params_final,
+        "theta": args.theta if material_law == "orthotropic" else None,
     }
     data_info = {
         "num_measurments": args.num_measurments,

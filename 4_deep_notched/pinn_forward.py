@@ -11,6 +11,7 @@ import json
 import argparse
 import platform
 import subprocess
+import warnings
 
 import numpy as np
 import jax
@@ -40,9 +41,11 @@ parser.add_argument('--n_iter', nargs='+', type=int, default=int(1e10), help='Nu
 parser.add_argument('--log_every', type=int, default=250, help='Log every n steps')
 parser.add_argument('--available_time', type=int, default=2, help='Available time in minutes')
 parser.add_argument('--log_output_fields', nargs='*', default=['Ux', 'Uy', 'Exx', 'Eyy', 'Exy', 'Sxx', 'Syy', 'Sxy'], help='Fields to log')
-parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+parser.add_argument('--lr', nargs='+', type=float, default=0.001, help='Learning rate')
 parser.add_argument('--n_retrain', type=int, default=5, help='Number of retraining iterations')
-parser.add_argument('--n_adaptive_sample', type=int, default=10, help='Number of adaptive sampling points per dimension')
+parser.add_argument('--max_adaptive_samples', type=int, default=3, help='Maximum number of adaptive samples sets')
+parser.add_argument('--n_adaptive_sample', nargs='+', type=int, default=10, help='Number of adaptive sampling points per dimension')
+parser.add_argument('--balance_weights', nargs='+', type=int, default=1, help='Boolean indicating if loss weights are recalculated at each retraining')
 parser.add_argument('--loss_fn', nargs='+', default='MSE', help='Loss functions')
 parser.add_argument('--loss_weights', nargs='+', type=float, default=[1,1,1,1,1,1,1,1,1,1], help='Loss weights (more on DIC points)')
 parser.add_argument('--num_point_PDE', type=int, default=10000, help='Number of collocation points for PDE evaluation')
@@ -50,25 +53,31 @@ parser.add_argument('--num_point_test', type=int, default=10000, help='Number of
 
 parser.add_argument('--net_width', type=int, default=32, help='Width of the network')
 parser.add_argument('--net_depth', type=int, default=3, help='Depth of the network')
-parser.add_argument('--activation', choices=['tanh', 'relu', 'elu'], default='tanh', help='Activation function')
+parser.add_argument('--rank', type=int, default=50, help='Rank for SPINN')
+parser.add_argument('--activation', choices=['tanh','sin', 'relu', 'elu'], default='tanh', help='Activation function')
 parser.add_argument('--optimizer', choices=['adam'], default='adam', help='Optimizer')
-parser.add_argument('--mlp', choices=['mlp', 'modified_mlp'], default='mlp', help='Type of MLP for SPINN')
+parser.add_argument('--mlp', choices=['mlp', 'modified-mlp'], default='mlp', help='Type of MLP for SPINN')
 parser.add_argument('--initialization', choices=['Glorot uniform', 'He normal'], default='Glorot uniform', help='Initialization method')
+parser.add_argument('--n_fourier_features', type=int, default=100, help='Number of Fourier features')
 
+parser.add_argument('--use_DIC', type=int, choices=[0, 1], default=1, help='Use DIC measurements')
 parser.add_argument('--measurments_type', choices=['displacement','strain'], default='strain', help='Type of measurements')
 parser.add_argument('--num_measurments', nargs='+', type=int, default=[100,100], help='Number of measurements (should be a perfect square)')
 parser.add_argument('--noise_magnitude', type=float, default=1e-6, help='Gaussian noise magnitude (not for DIC simulated)')
 parser.add_argument('--u_0', nargs='+', type=float, default=[0,0], help='Displacement scaling factor for Ux and Uy, default(=0) use measurements norm')
 parser.add_argument('--s_0', nargs='+', type=float, default=[1,1,1], help='Stress scaling factor for Sxx, Syy, and Sxy')
 parser.add_argument('--params_iter_speed', nargs='+', type=float, default=[1,1], help='Scale iteration step for each parameter')
-parser.add_argument('--coord_normalization', type=bool, default=True, help='Normalize the input coordinates')
+parser.add_argument('--coord_normalization', type=int, default=1, help='Normalize the input coordinates')
 parser.add_argument('--stress_integral', type=bool, default=False, help='Impose stress integral to be equal to the side load')
 parser.add_argument('--material_law', choices=['isotropic', 'orthotropic'], default='isotropic', help='Material law')
 parser.add_argument('--corner_eps', type=float, default=0, help='Corner epsilon for contact boundary conditions')
+parser.add_argument('--displacement_BC', type=int, choices=[0, 1], default=0, help='Use displacement BC at the top and bottom edges')
 
 parser.add_argument('--FEM_dataset', type=str, default='3x3mm.dat', help='Path to FEM data')
 parser.add_argument('--DIC_dataset_path', type=str, default='no_dataset', help='If default no_dataset, use FEM model for measurements')
 parser.add_argument('--DIC_dataset_number', type=int, default=1, help='Only for DIC simulated measurements')
+parser.add_argument('--DIC_region', nargs='+', type=float, default=[0, 100, 0, 100], help='Region for DIC measurements [x_min, x_max, y_min, y_max]')
+parser.add_argument('--theta', type=float, default=45.0, help='Rotation angle for orthotropic material in degrees')
 parser.add_argument('--results_path', type=str, default='results_inverse', help='Path to save results')
 
 args = parser.parse_args()
@@ -111,6 +120,7 @@ if material_law == "isotropic":
 elif material_law == "orthotropic":
     # orthotropic plane‐stress
     Q11, Q22, Q12, Q66 = 41e3, 10.3e3, 3.1e3, 4e3   # N/mm^2
+    theta = np.deg2rad(args.theta)  # Convert angle to radians for calculations
 
     def constitutive_stress(eps_xx, eps_yy, eps_xy):
         # plane‐stress modified constants
@@ -118,6 +128,32 @@ elif material_law == "orthotropic":
         σ_yy = Q12*eps_xx + Q22*eps_yy
         σ_xy = 2*Q66*eps_xy
         return σ_xx, σ_yy, σ_xy
+    def constitutive_stress(eps_xx, eps_yy, eps_xy):
+
+        # (N,2,2) strain tensor from 3 components
+        eps = jnp.stack([eps_xx, eps_xy, eps_xy, eps_yy], axis=-1).reshape(-1, 2, 2)
+
+        # Rotation matrices (2,2)
+        c, s = jnp.cos(theta), jnp.sin(theta)
+        R  = jnp.array([[c, -s],
+                        [s,  c]])
+        RT = R.T
+
+        # Rotate strain: eps_local = RT @ eps @ R   (N,2,2)
+        eps_local = jnp.einsum('ij,njk,kl->nil', RT, eps, R)
+
+        # Stress in material coordinates (N,2,2), directly built with reshape
+        sigma_local = jnp.stack([
+            Q11*eps_local[:,0,0] + Q12*eps_local[:,1,1],   # σ11
+            2*Q66*eps_local[:,0,1],                        # σ12
+            2*Q66*eps_local[:,0,1],                        # σ21
+            Q12*eps_local[:,0,0] + Q22*eps_local[:,1,1]    # σ22
+        ], axis=-1).reshape(-1, 2, 2)
+
+        # Rotate back to global
+        sigma_global = jnp.einsum('ij,njk,kl->nil', R, sigma_local, RT)
+
+        return sigma_global[:,0,0], sigma_global[:,1,1], sigma_global[:,0,1]
 
 # Load
 pstress = 50.0
@@ -168,7 +204,7 @@ def calcNormal(x):
 n_rows = 100
 n_cols = 100
 
-FEM_dataset = f"{material_law}_{n_rows}x{n_cols}.dat"
+FEM_dataset = f"{material_law}_{n_rows}x{n_cols}{f'_{args.theta}deg' if material_law == 'orthotropic' else ''}.dat"
 dir_path = os.path.dirname(os.path.realpath(__file__))
 fem_file = os.path.join(dir_path, r"data_fem", FEM_dataset)
 
@@ -286,9 +322,8 @@ if args.measurments_type == "displacement":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, x_max, args.num_measurments[0]).reshape(-1, 1),
-                       np.linspace(0, y_max, args.num_measurments[1]).reshape(-1, 1)]
-
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                       np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = solution_fn(X_DIC_input)[:, :2]
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
 
@@ -297,7 +332,8 @@ if args.measurments_type == "displacement":
                                           lambda x, f, x_np: f[0][:, 0:1]/DIC_norms[0])
     measure_Uy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 1:2]/DIC_norms[1],
                                           lambda x, f, x_np: f[0][:, 1:2]/DIC_norms[1])
-    bcs += [measure_Ux, measure_Uy]
+    if args.use_DIC:
+        bcs += [measure_Ux, measure_Uy]
 
 elif args.measurments_type == "strain":
     if args.DIC_dataset_path != "no_dataset":
@@ -318,8 +354,8 @@ elif args.measurments_type == "strain":
             print(f"For this DIC dataset, the number of measurements is fixed to {x_values.shape[0] * y_values.shape[0]}")
             args.num_measurments = x_values.shape[0] * y_values.shape[0]
     else:
-        X_DIC_input = [np.linspace(0, x_max, args.num_measurments[0]).reshape(-1, 1),
-                       np.linspace(0, y_max, args.num_measurments[1]).reshape(-1, 1)]
+        X_DIC_input = [np.linspace(args.DIC_region[0], args.DIC_region[1], args.num_measurments[0]).reshape(-1, 1),
+                       np.linspace(args.DIC_region[2], args.DIC_region[3], args.num_measurments[1]).reshape(-1, 1)]
         DIC_data = strain_fn(X_DIC_input)
         DIC_data += np.random.normal(0, args.noise_magnitude, DIC_data.shape)
     DIC_norms = np.mean(np.abs(DIC_data), axis=0) # to normalize the loss
@@ -329,8 +365,8 @@ elif args.measurments_type == "strain":
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 1:2]/DIC_norms[1])
     measure_Exy = dde.PointSetOperatorBC(X_DIC_input, DIC_data[:, 2:3]/DIC_norms[2],
                                            lambda x, f, x_np: strain_from_output(x, f)[:, 2:3]/DIC_norms[2])
-    bcs += [measure_Exx, measure_Eyy, measure_Exy]
-
+    if args.use_DIC:
+        bcs += [measure_Exx, measure_Eyy, measure_Exy]
 else:
     raise ValueError("Invalid measurement type. Choose 'displacement' or 'strain'.")
 
@@ -404,12 +440,12 @@ segs_Sxy = [
 def HardBC(x, f):
     if isinstance(x, list):
         x = transform_coords(x)
-    if args.coord_normalization:
-        x *= jnp.array([x_max, y_max])  # Normalize coordinates to [0, 1]
+    # if args.coord_normalization:
+    #     x *= jnp.array([x_max, y_max])  # Normalize coordinates to [0, 1]
     x_mapped = jax.vmap(coordMap)(x)
 
-    Ux = f[:, 0] * x[:, 1] / y_max * (y_max - x[:, 1]) / y_max * args.u_0[0]
-    Uy = f[:, 1] * x[:, 1] / y_max * (y_max - x[:, 1]) / y_max * args.u_0[1] + uy_top * (x[:, 1] / y_max)
+    Ux = f[:, 0] * x[:, 1] / y_max * (y_max - x[:, 1]) / y_max * args.u_0[0] if args.displacement_BC else f[:, 0] * args.u_0[0]
+    Uy = f[:, 1] * x[:, 1] / y_max * (y_max - x[:, 1]) / y_max * args.u_0[1] + uy_top * (x[:, 1] / y_max) if args.displacement_BC else f[:, 1] * args.u_0[1]
 
     Sxx = f[:, 2] * bc_factor(x_mapped[:, 0], x_mapped[:, 1], segs_Sxx, "C0+")
     Syy = f[:, 3]
@@ -454,12 +490,34 @@ def input_scaling(x):
     if isinstance(x, list):
         return [x_el / x_max for x_el in x]
     else:
-        return x / x_max
+        return x / np.array([x_max, y_max])
+
+# =============================================================================
+# 7. Fourier Features
+# =============================================================================
+
+def list_handler(func):
+    def wrapper(x, *args, **kwargs):
+        if isinstance(x, (list, tuple)):
+            return [func(xi, *args, **kwargs) for xi in x]
+        return func(x, *args, **kwargs)
+    return wrapper
+
+@list_handler
+def fourier_features_transform(x, sigma=10, num_features=args.n_fourier_features):
+    """Generate Fourier features for input x."""
+    kernel = jax.random.normal(
+        jax.random.PRNGKey(0), (x.shape[-1], num_features)
+    ) * sigma
+    y = jnp.concatenate(
+        [x, jnp.cos(jnp.dot(x, kernel)), jnp.sin(jnp.dot(x, kernel))], axis=-1
+    )
+    return y
 
 # =============================================================================
 # 7. Define Neural Network, Data, and Model
 # =============================================================================
-layers = [2] + [args.net_width] * args.net_depth + [5]
+layers = [2] + [args.net_width] * args.net_depth + [args.rank] + [5]
 net = dde.nn.SPINN(layers, args.activation, args.initialization, args.mlp)
 batch_size = args.num_point_PDE + args.num_measurments[0] * args.num_measurments[1]
 num_params = sum(p.size for p in jax.tree.leaves(net.init(jax.random.PRNGKey(0), jnp.ones(layers[0]))))
@@ -473,12 +531,19 @@ data = dde.data.PDE(
     num_test=args.num_point_test,
     is_SPINN=True,
 )
-if args.coord_normalization:
+if args.coord_normalization and (args.n_fourier_features > 0):
+    net.apply_feature_transform(lambda x: fourier_features_transform(input_scaling(x)))
+elif args.coord_normalization:
     net.apply_feature_transform(input_scaling)
+elif args.n_fourier_features > 0:
+    net.apply_feature_transform(fourier_features_transform)
+# if args.coord_normalization:
+#     net.apply_feature_transform(input_scaling)
+
 net.apply_output_transform(HardBC)
 
 model = dde.Model(data, net)
-model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+model.compile(args.optimizer, lr=args.lr[0], metrics=["l2 relative error"],
               loss_weights=args.loss_weights, loss=args.loss_fn)
               #external_trainable_variables=trainable_variables)
 
@@ -493,7 +558,8 @@ else:
     dic_prefix = ''
     noise_prefix = f"{args.noise_magnitude}noise"
 num_measurments_str = f"{X_DIC_input[0].shape[0]}x{X_DIC_input[1].shape[0]}"
-folder_name = f"{dic_prefix}{args.material_law}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else args.n_iter[0]}{'min' if args.available_time else 'iter'}"
+n_iter_str = sum(args.n_iter) if isinstance(args.n_iter, list) else args.n_iter
+folder_name = f"{dic_prefix}{args.material_law}_{num_measurments_str}_{noise_prefix}_{args.available_time if args.available_time else n_iter_str}{'min' if args.available_time else 'iter'}"
 existing_folders = [f for f in os.listdir(results_path) if f.startswith(folder_name)]
 if existing_folders:
     suffixes = [int(f.split("-")[-1]) for f in existing_folders if f != folder_name]
@@ -570,7 +636,9 @@ def PDE_loss(X):
 # 9. Calculate Loss Weights based on the Gradient of the Loss Function
 # =============================================================================
 from jax.flatten_util import ravel_pytree
-bc_anchors = [X_integral, X_free_left, X_free_right, X_DIC_input, X_DIC_input]
+bc_anchors = [X_integral, X_free_left, X_free_right]
+if args.use_DIC:
+    bc_anchors += [X_DIC_input, X_DIC_input]
 pde_anchors = [[x_all, y_all]]
 all_anchors = bc_anchors + pde_anchors
 
@@ -603,25 +671,49 @@ def calc_loss_weights(model):
 start_time = time.time()
 # print(f"E(GPa): {E_init * params_factor[0].value * args.params_iter_speed[0]/1e3:.3f}, nu: {nu_init * params_factor[1].value * args.params_iter_speed[1]:.3f}")
 # losshistory, train_state = model.train(iterations=args.n_iter, callbacks=callbacks, display_every=args.log_every)
-pde_anchors = [[x_all, y_all], [x_notch, y_notch]] # Initial PDE anchors
+pde_anchors = [[x_pde, y_pde], [x_notch, y_notch]] if args.sample_notch else [[x_pde, y_pde]]
 if isinstance(args.n_iter, int):
     n_iter = [args.n_iter] * args.n_retrain
 else:
     n_iter = args.n_iter
+
+if len(args.n_adaptive_sample) != args.n_retrain:
+    args.n_adaptive_sample = [args.n_adaptive_sample[0]] * args.n_retrain
+    # print("Warning: n_adaptive_sample length does not match n_retrain. Using the first value for all retrain steps.")
+
+if len(args.balance_weights) != args.n_retrain:
+    args.balance_weights = [args.balance_weights[0]] * args.n_retrain
+    # print(
+    #     "Warning: n_adaptive_sample length does not match n_retrain. "
+    #     "Using the first value for all retrain steps."
+    # )
+if len(args.lr) != args.n_retrain:
+    args.lr = [args.lr[0]] * args.n_retrain
+    # print("Warning: lr length does not match n_retrain. Using the first value for all retrain steps.")
+
 for i in range(args.n_retrain):
     if i > 0:
-        x_sample, y_sample = adaptive_sampling_grid(domain,
-                                                    n=args.n_adaptive_sample,
-                                                    loss_fun=PDE_loss)
-        pde_anchors += [[x_sample, y_sample]]
-        data.replace_with_anchors(pde_anchors)
+        if args.n_adaptive_sample[i] > 0:
+            x_sample, y_sample = adaptive_sampling_grid(domain,
+                                                        n=args.n_adaptive_sample[i],
+                                                        loss_fun=PDE_loss)
+            pde_anchors += [[x_sample, y_sample]]
+            if len(pde_anchors) > args.max_adaptive_samples+1:
+                del pde_anchors[1]
+            data.replace_with_anchors(pde_anchors)
+            print(f"Adding {x_sample.shape[0]**2} points")
 
-        loss_weights_grads, loss_grads = calc_loss_weights(model)
-        new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
-        model.compile(args.optimizer, lr=args.lr, metrics=["l2 relative error"],
+        # Calculate new loss weights if requested
+        if args.balance_weights[i]:
+            loss_weights_grads, loss_grads = calc_loss_weights(model)
+            new_loss_weights = [w * g for w, g in zip(args.loss_weights, loss_weights_grads)]
+        else:
+            # Only update if not already set to args.loss_weights
+            if 'new_loss_weights' not in locals():
+                new_loss_weights = args.loss_weights
+        model.compile(args.optimizer, lr=args.lr[i], metrics=["l2 relative error"],
                       loss_weights=new_loss_weights, loss=args.loss_fn)
-        print(f"Retraining {i+1}/{args.n_retrain} adding {x_sample.shape[0]**2} points")
-
+    print(f"Retrain step {i+1}/{args.n_retrain}, training for {n_iter[i]} iterations with loss weights: {[round(float(w), 2) for w in model.loss_weights]}")
     losshistory, train_state = model.train(iterations=n_iter[i], callbacks=callbacks, display_every=args.log_every)
 
 elapsed = time.time() - start_time
@@ -653,6 +745,12 @@ dde.utils.save_loss_history(losshistory, os.path.join(new_folder_path, "loss_his
 # nu_final = np.mean([eval(line.strip().split(' ', 1)[1])[1] for line in lines[-10:]])
 # print(f"Final E(GPa): {E_final/1e3:.3f}, nu: {nu_final:.3f}")
 
+residual_history = np.array(losshistory.metrics_test)
+residual_min = residual_history.min(axis=0)
+residual_end = residual_history[-1, :]
+residual_mean_end = residual_history[-10:, :].mean(axis=0)
+
+
 def log_config(fname):
     """
     Save configuration and execution details to a JSON file, grouped by category.
@@ -668,10 +766,19 @@ def log_config(fname):
         gpu_info = {"GPU": "No GPU found", "Total GPU Memory": "N/A"}
     
     execution_info = {
-        "n_iter": train_state.epoch,
+        "n_iter": args.n_iter,
         "elapsed": elapsed,
         "iter_per_sec": train_state.epoch / elapsed,
         "backend": dde.backend.backend_name,
+        "residual_min": residual_min.tolist(),
+        "residual_end": residual_end.tolist(),
+        "residual_mean_end": residual_mean_end.tolist(),
+        "num_retrain": args.n_retrain,
+        "num_adaptive_sample": args.n_adaptive_sample,
+        "max_adaptive_samples": args.max_adaptive_samples,
+        "balance_weights": args.balance_weights,
+        "num_points_pde": sum([anchor[0].shape[0] * anchor[1].shape[0] for anchor in pde_anchors]),
+        # "final_loss_weights": model.loss_weights.tolist(),
     }
     network_info = {
         "net_width": args.net_width,
@@ -696,6 +803,9 @@ def log_config(fname):
         "E": E if material_law == "isotropic" else [Q11, Q22, Q12, Q66],
         "nu": nu if material_law == "isotropic" else None,
         "uy_top": uy_top,
+        "theta": args.theta if material_law == "orthotropic" else None,
+        "corner_eps": args.corner_eps,
+        "coord_normalization": args.coord_normalization,
         # "E_actual": E_actual,
         # "nu_actual": nu_actual,
         # "E_init": E_init,
@@ -704,15 +814,40 @@ def log_config(fname):
         # "nu_final": nu_final,
     }
     data_info = {
+        "use_DIC": args.use_DIC,
         "num_measurments": args.num_measurments,
         "noise_magnitude": args.noise_magnitude,
         "measurments_type": args.measurments_type,
         "DIC_dataset_path": args.DIC_dataset_path,
         "DIC_dataset_number": args.DIC_dataset_number,
+        "DIC_region": args.DIC_region,
         "FEM_dataset": FEM_dataset, 
     }
     info = {"system": system_info, "gpu": gpu_info, "execution": execution_info,
             "network": network_info, "problem": problem_info, "data": data_info}
+    
+    def safe_convert(obj, path="root"):
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                out[k] = safe_convert(v, f"{path}.{k}")
+            return out
+        elif isinstance(obj, (list, tuple)):
+            out = []
+            for i, v in enumerate(obj):
+                try:
+                    out.append(safe_convert(v, f"{path}[{i}]"))
+                except Exception:
+                    warnings.warn(f"Skipping non-serializable entry at {path}[{i}]")
+            return out
+        else:
+            try:
+                json.dumps(obj)  # test if serializable
+                return obj
+            except (TypeError, OverflowError):
+                warnings.warn(f"Skipping non-serializable entry at {path} ({type(obj)})")
+                return None  # or skip entirely
+    info = safe_convert(info)
     with open(fname, "w") as f:
         json.dump(info, f, indent=4)
 

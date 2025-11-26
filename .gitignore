@@ -1,6 +1,12 @@
-**/results*/**/*.dat
+**/results*/**
+**/__pycache__/**
 1_side_loaded_plate/2_noise_study/results/0noise/*
 1_side_loaded_plate/2_noise_study/results/1noise/*
 1_side_loaded_plate/0_test/*
 1_side_loaded_plate/pinn_inverse_direct.py
 3_iosipescu/0_test/results/*
+4_bending_beam/*
+4_deep_notched/*/*.mp4
+4_deep_notched/*/*.png
+
+1_side_loaded_plate/3_missing_data/displacement_20x20_1e-06noise_10min-4_Ux_Uy_Sxx_Syy_Sxy_time.mp4
